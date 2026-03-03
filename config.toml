@@ -1,0 +1,38 @@
+# birdhash configuration
+
+[general]
+data_dir = "data"
+threads = 0  # 0 = use all available cores
+
+[generator]
+shard_size = 1_000_000_000  # 10亿 entries per L1 shard (~965 MB BinaryFuse8)
+
+[disk]
+l1_ratio = 0.6           # L1 occupies 60% of disk budget
+watermark = 0.8           # trigger L1→L2 downgrade at 80% usage
+
+[fetcher]
+# 多 URL 失败时按序降级；可从创世块 0 补全: birdhash fetch
+# rpc_url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+rpc_urls = [
+  "https://eth.llamarpc.com",
+  "https://cloudflare-eth.com",
+  "https://ethereum.publicnode.com",
+  "https://1rpc.io/eth",
+  "https://eth.drpc.org",
+  "https://rpc.ankr.com/eth",
+  "https://ethereum.public.blockpi.network/v1/rpc/public",
+  "https://eth.api.onfinality.io/public",
+  "https://rpc.mevblocker.io",
+  "https://rpc.flashbots.net",
+  "https://ethereum-mainnet.gateway.tatum.io"
+]
+batch_size = 10           # blocks per JSON-RPC batch request
+timeout_secs = 30         # 单次请求超时(秒)，超时或失败即换下一个 URL 轮询
+retry_count = 5           # (池内不重试，仅 fetch-one 等单 URL 时用)
+retry_base_ms = 1000
+archive_segment = 100000  # blocks per archive file (10万)
+poll_interval_secs = 12   # 实时轮询间隔(秒)，0=只跑历史不轮询
+
+[scanner]
+default_chunk_size = 10_000_000_000  # 100亿 counter per distributed task
