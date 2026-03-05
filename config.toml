@@ -15,8 +15,6 @@ watermark = 0.8           # trigger L1→L2 downgrade at 80% usage
 # 多 URL 失败时按序降级；可从创世块 0 补全: birdhash fetch
 # rpc_url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
 rpc_urls = [
-  "https://eth.llamarpc.com",
-  "https://cloudflare-eth.com",
   "https://ethereum.publicnode.com",
   "https://1rpc.io/eth",
   "https://eth.drpc.org",

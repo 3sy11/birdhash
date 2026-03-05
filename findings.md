@@ -528,6 +528,14 @@ birdhash/
 
 ---
 
+## 获取器职责分离（Phase 10 设计）
+
+- **获取器仅负责**：按区间 [start_block, end_block] + 指定 rpc_url 拉取块的**原始数据**并落盘。
+- **输出约定**：目录 `{start_block}-{end_block}/` 下两个文件：
+  - 原始块：一行一块的文本（建议 JSONL），按块号顺序追加。
+  - 检查点：如 `checkpoint.json`，含 start/end、last_fetched_block、status，用于断点续跑。
+- **不再由获取器完成**：all_addrs.bin、filter_fetch.bin、new_addrs.bin、AddressStore、BinaryFuse16 构建、BHFA 归档（或改为可选/仅作原始块另一种格式）。上述碰撞用中间数据改由**碰撞器（或独立导入流水线）**在后续计划中读取原始块文件后生成。
+
 ## Issues Encountered
 | Issue | Resolution |
 |-------|------------|

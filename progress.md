@@ -1,5 +1,10 @@
 # Progress Log
 
+## Session: 获取器职责分离与计划重订 + Phase 10 实施
+- **Goal:** 获取器只拉原始数据；接收 start/end block、rpc_url；输出到 `{start}-{end}/` 目录（一行一块 + 检查点）；碰撞中间数据移至碰撞器（后续计划）。
+- **Actions:** 重写 task_plan.md；实施 Phase 10：CLI Fetch 改为 --start-block/--end-block/--rpc/--output-dir；config 增加 fetcher_ranges_dir()；fetcher.rs 精简为 run_fetch_range + FetchRangeCheckpoint，输出 blocks.jsonl + checkpoint.json；删除 Fetcher 大循环/archive/filter 写入；保留 AddressStore/load_new_addrs/save_new_addrs 供 Collider/Scanner。
+- **Status:** Phase 10 完成；cargo test 55/55 通过。
+
 ## Session: 2026-03-02
 
 ### Phase 1: 需求与技术选型 + 架构设计 (最终版)

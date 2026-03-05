@@ -27,6 +27,7 @@ bincode = "1"
 ureq = { version = "2", features = ["json"] }
 toml = "0.8"
 rlp = "0.5"
+indicatif = "0.17"
 
 [profile.release]
 opt-level = 3

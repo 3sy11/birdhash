@@ -125,6 +125,10 @@ impl AppConfig {
     pub fn archive_dir(&self) -> PathBuf {
         self.fetcher_dir().join("archives")
     }
+    /// 获取器区间输出根目录，子目录为 {start_block}-{end_block}
+    pub fn fetcher_ranges_dir(&self) -> PathBuf {
+        self.fetcher_dir().join("ranges")
+    }
 
     pub fn ensure_dirs(&self) -> anyhow::Result<()> {
         for d in [

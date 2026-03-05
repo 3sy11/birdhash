@@ -11,7 +11,7 @@ mod lifecycle;
 mod scanner;
 mod stats;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -37,11 +37,17 @@ enum Commands {
         #[arg(short, long)]
         threads: Option<usize>,
     },
-    /// Fetch on-chain addresses (block traversal → archive + BinaryFuse16)
+    /// Fetch raw blocks by batch: 1=1..100000, 2=100001..200000, ... Multiple batches run in parallel (threads).
     Fetch {
-        /// RPC URL (overrides config.toml [fetcher].rpc_url)
-        #[arg(short, long)]
+        /// Batch index (1-based). Multiple: --batch 1 2 3 4 or --batch 1,2,3,4. Single/omit = latest batch.
+        #[arg(long, num_args(1..), value_delimiter(','))]
+        batch: Option<Vec<u64>>,
+        /// RPC URL (required or set [fetcher].rpc_url in config). Also accepted as --rpc-url.
+        #[arg(short, long, alias = "rpc-url")]
         rpc: Option<String>,
+        /// Output root dir (default: data/fetcher/ranges)
+        #[arg(long)]
+        output_dir: Option<String>,
     },
     /// Test fetcher: fetch one block and print block info, transactions, and extracted addresses
     FetchTest {
@@ -101,7 +107,7 @@ fn main() -> Result<()> {
         Commands::Init => cmd_init(cfg),
         Commands::Status => cmd_status(cfg),
         Commands::Generate { threads } => cmd_generate(cfg, threads),
-        Commands::Fetch { rpc } => cmd_fetch(cfg, rpc),
+        Commands::Fetch { batch, rpc, output_dir } => cmd_fetch(cfg, batch.as_deref(), rpc, output_dir, &cli.config),
         Commands::FetchTest { rpc, block } => cmd_fetch_test(cfg, rpc, block),
         Commands::Collide { regenerate_range } => cmd_collide(cfg, regenerate_range),
         Commands::Purge { keep_last, archive } => cmd_purge(cfg, keep_last, archive),
@@ -267,12 +273,84 @@ fn cmd_scan_collect(cfg: config::AppConfig, results_dir: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_fetch(cfg: config::AppConfig, rpc_cli: Option<String>) -> Result<()> {
-    let rpc_urls = resolve_rpc_urls(&cfg, rpc_cli)?;
+const SEGMENT_SIZE: u64 = 100_000;
+
+fn cmd_fetch(cfg: config::AppConfig, batches: Option<&[u64]>, rpc_cli: Option<String>, output_dir: Option<String>, _config_path: &str) -> Result<()> {
+    let rpc_urls = resolve_rpc_urls(&cfg, rpc_cli.clone())?;
     cfg.ensure_dirs()?;
-    let cur: cursor::FetcherCursor = cursor::load_or_default(&cfg.fetch_cursor_path());
-    let mut f = fetcher::Fetcher::new(cfg, cur, &rpc_urls)?;
-    f.run()
+    let out_root = output_dir.clone().map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_ranges_dir());
+    std::fs::create_dir_all(&out_root)?;
+    let mut pool = fetcher::RpcPool::new(rpc_urls.clone(), cfg.rpc_timeout_secs);
+    let latest = pool.get_latest_block_number()?;
+    let total_batches = (latest + SEGMENT_SIZE - 1) / SEGMENT_SIZE;
+    anyhow::ensure!(total_batches >= 1, "chain has no blocks (latest=0)");
+    let batches: Vec<u64> = match batches {
+        None => vec![total_batches],
+        Some(s) if s.is_empty() => vec![total_batches],
+        Some(s) => s.to_vec(),
+    };
+    for &b in &batches { anyhow::ensure!(b >= 1 && b <= total_batches, "batch {} out of range 1..{}", b, total_batches); }
+    if batches.len() > 1 {
+        run_fetch_multi(&batches, latest, total_batches, &out_root, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size)?;
+        return Ok(());
+    }
+    let batch = batches[0];
+    let prefix = std::env::var("BIRDHASH_BATCH").ok().map(|b| format!("[batch={}] ", b)).unwrap_or_default();
+    println!("{}latest={} total_batches={} batch={}", prefix, latest, total_batches, batch);
+    let start_block = (batch - 1) * SEGMENT_SIZE + 1;
+    let end_block = (batch * SEGMENT_SIZE).min(latest);
+    fetcher::run_fetch_range(&out_root, start_block, end_block, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None)
+}
+
+fn run_fetch_multi(batches: &[u64], latest: u64, total_batches: u64, out_root: &std::path::Path, rpc_urls: &[String], timeout_secs: u64, batch_size: usize) -> Result<()> {
+    use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::thread;
+    let num_workers = batches.len();
+    println!("latest={} total_batches={} spawning {} workers: batches {:?}", latest, total_batches, num_workers, batches);
+    let (progress_tx, progress_rx) = mpsc::channel::<(u64, u64, u64, u64, f64)>();
+    let multi = MultiProgress::new();
+    let style = ProgressStyle::default_bar().template("{msg} {bar:40.cyan/blue} {pos:>7}/{len:7}").unwrap();
+    let total_blocks: Vec<(u64, u64)> = batches.iter().map(|&b| { let start = (b - 1) * SEGMENT_SIZE + 1; let end = (b * SEGMENT_SIZE).min(latest); (start, end) }).collect();
+    let batch_to_idx: HashMap<u64, usize> = batches.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let total_blocks_d = total_blocks.clone();
+    let bars: Vec<_> = batches.iter().enumerate().map(|(i, &b)| {
+        let (start, end) = total_blocks[i];
+        let len = end - start + 1;
+        let pb = multi.add(ProgressBar::new(len).with_style(style.clone()).with_message(format!("[batch={}] {}..{} | 0 blk/s", b, start, end)));
+        (b, pb)
+    }).collect();
+    let display_handle = thread::spawn(move || {
+        while let Ok((batch_id, _current, end, written, blk_s)) = progress_rx.recv() {
+            if let Some(&idx) = batch_to_idx.get(&batch_id) {
+                let (_, ref pb) = bars[idx];
+                pb.set_position(written);
+                let (start, _) = total_blocks_d[idx];
+                pb.set_message(format!("[batch={}] {}..{} | {:.0} blk/s", batch_id, start, end, blk_s));
+            }
+        }
+        for (_, pb) in &bars { pb.finish_with_message("done"); }
+    });
+    let mut handles = Vec::with_capacity(batches.len());
+    for (i, &b) in batches.iter().enumerate() {
+        let (start_block, end_block) = total_blocks[i];
+        let out = out_root.to_path_buf();
+        let urls = rpc_urls.to_vec();
+        let tx_send = progress_tx.clone();
+        handles.push(thread::spawn(move || {
+            let prog = Some((b, tx_send));
+            fetcher::run_fetch_range(&out, start_block, end_block, &urls, timeout_secs, batch_size, None, prog)
+        }));
+    }
+    drop(progress_tx);
+    for (i, h) in handles.into_iter().enumerate() {
+        let res = h.join().map_err(|_| anyhow::anyhow!("thread panicked"))?;
+        res.with_context(|| format!("batch {} failed", batches[i]))?;
+    }
+    display_handle.join().map_err(|_| anyhow::anyhow!("display thread panicked"))?;
+    println!("All {} batches done.", num_workers);
+    Ok(())
 }
 
 fn resolve_rpc_urls(cfg: &config::AppConfig, rpc_cli: Option<String>) -> Result<Vec<String>> {
