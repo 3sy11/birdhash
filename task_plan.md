@@ -1,57 +1,136 @@
-# Task Plan: birdhash — 获取器职责分离与重构
+# Task Plan: 碰撞器执行计划（三组件独立进程 + 主进程编排）
 
 ## Goal
-将**获取器（Fetcher）**职责限定为**仅拉取并持久化原始块数据**；接收传入的起始块 ID、结束块 ID 与 RPC URL，将结果写入以「起始ID-结束ID」命名的文件夹（内含原始块一行一块的文本文件 + 区间内检查点文件，便于断点续跑）。**碰撞用中间/临时数据**（如 all_addrs、filter_fetch、new_addrs 等）的生成逻辑移至**碰撞器（Collider）**，在后续计划中实现。
+
+设计并实现**获取器（Fetcher）、生成器（Generator）、碰撞器（Collider）** 三个组件，均为**独立进程**工作（各自 CLI 启动）；可选由**主进程**统一启动三者（子进程或线程），实现三组件间的数据通信与协作。
 
 ## Current Phase
-Phase 10 已完成；Phase 11 待后续实施
+
+Phase 1：需求与约束确认
+
+## 三组件进程与主进程编排
+
+- **获取器、生成器、碰撞器**：均为**独立进程**，可单独执行：
+  - `birdhash fetch ...` — 获取器进程（已存在）
+  - `birdhash generate ...` — 生成器进程（待实现）
+  - `birdhash collide ...` — 碰撞器进程（待实现）
+- **是否用主进程统一启动**：可以。通过**主进程**分别启动上述三个组件的**进程或线程**，由主进程负责三者间的数据通信与生命周期。
+  - **方案 A（主进程 + 三子进程）**：主进程 spawn 三个子进程（fetcher、generator、collider），数据通过**共享目录/文件**（如 data/fetcher/、data/generator/cuckoo_*.bin）或 **IPC**（管道/消息队列/共享内存）通信；进程隔离、可独立重启。
+  - **方案 B（主进程 + 三线程）**：主进程内起三个线程（fetcher 线程、generator 线程、collider 线程），通过**进程内 channel 或共享结构**通信；实现简单、延迟低，但同机同进程。
+- 数据流：获取器 → BinaryFuse 过滤器（链上地址）；生成器 → 布谷鸟过滤器（生成地址）；碰撞器读两者做碰撞、写 hits。通信介质：文件（共享目录）或主进程下 channel/IPC。
 
 ## Phases
 
-### Phase 10: 获取器重构 — 仅原始数据 + 区间 + 检查点
-- [x] **10.1 接口与 CLI**：fetch 命令接收 `--start-block N`、`--end-block M`、`--rpc <URL>`（必填或 config）；范围由本次调用参数唯一确定。
-- [x] **10.2 输出目录与文件**：输出根目录默认 `data/fetcher/ranges`，可 `--output-dir` 覆盖；写入子目录 `{start_block}-{end_block}/`，内含 `blocks.jsonl`（一行一块 JSON）与 `checkpoint.json`。
-- [x] **10.3 获取器逻辑精简**：移除 Fetcher 大循环、archive、filter 重建、all_addrs/new_addrs 写入；仅 run_fetch_range：RPC 拉块 → 一行 JSON 追加 blocks.jsonl → 定期写检查点。
-- [x] **10.4 断点续跑**：检查点存在且 status != done 时从 last_fetched_block+1 继续，追加同一 blocks.jsonl，完成后 status=done。
-- [x] **10.5 配置**：config 新增 fetcher_ranges_dir()；CLI --rpc 覆盖 config。
-- **Status:** complete
+### Phase 1: 需求与约束确认
+- [ ] 确认三组件职责边界（获取器 / 生成器 / 碰撞器，均为独立进程）
+- [ ] 确认生成器输入：助记词序列形式、派生路径规则（BIP32/BIP44 或自定义）
+- [ ] 确认布谷鸟过滤器需求：可增删、误判率、持久化策略
+- [ ] 对照 SPEC.md 标注「采用/不采用」的条目，写入 findings.md
+- **Status:** in_progress
 
-### Phase 11（后续计划）: 碰撞器消费原始数据并生成中间数据
-- [ ] 碰撞器（或独立「导入」步骤）读取获取器产出的「一行一块」文件（及检查点确认 done），解析块内地址，生成碰撞所需的中间数据：如 all_addrs、BinaryFuse16 filter、new_addrs 等；写入位置与格式由碰撞器/流水线设计决定。
-- [ ] 与现有 Collider 集成：Collider 可依赖「由原始数据生成的」filter_fetch / 地址列表，而不依赖获取器直接写这些文件。
-- **Status:** not_started（后续计划，不在此次实施）
+### Phase 2: 生成器设计（助记词 + 派生路径 + 布谷鸟过滤器）
+- [ ] **助记词表**：已准备 `assets/wordlist/bip39_en.txt`（BIP39 英文 2048 词）；生成时按该表确定性枚举
+- [ ] **助记词序列生成**：可回溯、确定性；按 **ID 递进** 生成「下一个助记词顺序」（同一 ID 永远得到同一助记词序列，ID+1 得到下一个确定的序列）
+- [x] **派生地址生成规则**：路径 m / purpose' / coin_type' / account' / change / index；account 0-111，index 从 assets/derivation_candidates 读取
+- [ ] 派生路径规则：与上述规则配合；purpose/coin_type/change 固定或可配置，account/index 从候选文件读取
+- [ ] **种子 key 文件**：需额外配置**生成器种子 key 文件**（如 `generator_seed.key`），与 **ID** 共同参与生成 (privkey, address)，确保**每台机器启动时起点不同**；路径可配置（如 `[generator] seed_path`）。
+- [ ] 私钥/地址推导流程：**(种子 key, ID)** → 助记词序列(ID) → seed → 派生私钥(路径) → 公钥 → 地址（种子 key 与 ID 共同决定键值对）
+- [ ] **生成器进程打印**：不滚屏，单行刷新；内容：当前计算的 ID、前 3 个助记词 + "..."、当前 account id、当前 index id，便于确认进程在运行
+- [ ] 布谷鸟过滤器选型：Rust 库（如 cuckoofilter crate）；**设计见下「布谷鸟过滤器设计」**
+- [ ] 生成器输出：过滤器命名 = ID 范围；**检查点 = 落盘过滤器文件名**，无单独 cursor 文件
+- **Status:** pending
 
-## 获取器新设计摘要（Phase 10）
+#### 布谷鸟过滤器设计（生成器侧）
 
-| 项目 | 内容 |
-|------|------|
-| **输入** | `start_block`、`end_block`、`rpc_url`（必显式传入或 config 默认） |
-| **输出目录** | `{output_root}/{start_block}-{end_block}/` |
-| **文件 1** | 块的原始信息：一行一块的文本文件（如 JSON 或 JSONL），按块号顺序追加 |
-| **文件 2** | 检查点：如 `checkpoint.json`，含 start/end、last_fetched_block、status、时间戳 |
-| **职责** | 仅拉取并持久化原始块；不做地址去重、不建 filter、不写 all_addrs/new_addrs |
-| **断点续跑** | 读同目录检查点，从 last_fetched_block+1 继续，追加块文件并更新检查点 |
+- **存储策略**：生成 (privkey, address) 对时，**仅将 address 插入布谷鸟过滤器**；**私钥不存，只保留 ID**（命中后按 ID 重算私钥），最大限度把内存留给过滤器。
+- **命名与分片**：每个过滤器对应一段 **ID 范围**，命名即该范围，如 `cuckoo_00000000-00999999.bin`（表示 ID 0～9999999 的地址在该分片内）。索引 = 布谷鸟过滤器文件名/ID 范围。
+- **误判率与容量**：目标误判率 **0.001%**（ε=10⁻⁵）。由 ε ≤ b/2^(f−1) 得 **f ≥ 20 bits**；约 **2.6 bytes/地址**，每 1000 万地址约 26 MB。可配置 `shard_capacity`（每分片 ID 数）与 `cuckoo_max_memory_mb`、`cuckoo_max_disk_mb`。
+- **落盘**：当**该分片达到指定大小**且**当前分片对应的 ID 范围全部计算完成**后，做**一次落盘**（写入该分片文件）；落盘后该分片可继续留在内存或参与后续内存淘汰。
+- **内存上限与淘汰**：当**内存达到上限**时，对**最早的分片**（FIFO）：**释放其内存**并**删除其已落盘的文件**（若存在），即该分片彻底移除，腾出内存；用内存保证可用性。
+- **磁盘上限与淘汰**：当**硬盘达到上限**时，**删除最早落盘的过滤器文件**（FIFO），腾出磁盘给新落盘；近期/热数据优先保留在内存，用内存保证可用性。
+- **启动与恢复**：生成器**启动时**，**加载所有已落盘且可读的布谷鸟过滤器**到内存，然后从**下一个 ID** 继续生成私钥地址对。
+- **检查点**：**不单独维护检查点文件**；检查点由**已落盘过滤器 + 文件名**实现：进程重启后**扫描目录中的 cuckoo_*.bin 文件名**，解析 ID 范围，**下一个生成的 ID = 当前已覆盖的最大 end_id + 1**。
+
+### Phase 3: 碰撞器进程与三组件协作设计
+- [ ] 碰撞器进程职责：读取 fetcher 的 BinaryFuse 与生成器的布谷鸟，做碰撞；命中时写 hits
+- [ ] 生成器进程职责：独立进程，按助记词+派生路径持续生成地址并更新布谷鸟（落盘/淘汰见上）
+- [ ] 三组件数据通信：通过共享目录（data/fetcher/、data/generator/）或主进程下 IPC/channel；生成器写布谷鸟、碰撞器读布谷鸟与 BinaryFuse
+- [ ] 主进程编排（可选）：`birdhash run` 等命令启动三子进程或三线程，管理生命周期与通信
+- **Status:** pending
+
+### Phase 4: 实现与测试
+- [ ] 按 Phase 2 实现生成器**进程**（助记词+派生+布谷鸟，独立可执行）
+- [ ] 按 Phase 3 实现碰撞器**进程**及（可选）主进程编排
+- [ ] 单元测试与集成测试
+- **Status:** pending
+
+### Phase 5: 文档与收尾
+- [ ] 更新 README/SPEC 中碰撞器与生成器章节
+- [ ] 记录设计决策与未决项
+- **Status:** pending
 
 ## Key Questions
-1. 原始块「一行一块」的格式：纯 JSON 一行（便于 JSONL 解析）还是自定义二进制？→ 建议 JSONL 以便碰撞器/脚本通用解析。
-2. 输出根目录默认值：`data/fetcher/ranges/` 还是可配置？→ 建议 config `fetcher_output_dir` 或 `data_dir/fetcher/ranges`。
-3. 多任务并行：多进程分别跑不同 start-end 时，各写各自目录，互不干扰；无需共享 cursor。
+
+1. ~~助记词「序列」~~ → 已定：按 **ID 递进**、确定性、可回溯；助记词表已用 BIP39 英文 2048 词。
+2. 派生路径/派生地址规则：具体逻辑在**开始构建时**给定，当前占位。
+3. ~~布谷鸟删除~~ → 已定：不删单条；接近内存上限时**整分片 FIFO 释放**（最早 ID 范围的分片）。
+4. 生成器与原有 keygen（HMAC-SHA256 + counter）是替代关系还是并存（两套生成模式）？
 
 ## Decisions Made
+
 | Decision | Rationale |
 |----------|-----------|
-| 获取器只产出原始块 + 检查点 | 职责单一，碰撞与索引由下游完成 |
-| 目录名 `{start}-{end}` | 区间明确，多任务可并行写不同目录 |
-| 一行一块文本（JSONL） | 易解析、易断点续写、易被其他工具消费 |
-| 检查点单独文件 | 与块数据分离，更新检查点不影响大文件 |
-| 碰撞中间数据移至碰撞器 | 后续计划中实现，本计划不实现 |
+| 生成器地址过滤器用布谷鸟过滤器 | 需持续更新（增删），BinaryFuse/Xor 不可变，布谷鸟支持动态插入 |
+| 生成器、碰撞器、获取器均为独立进程 | 各自 CLI 启动，可单独跑；可选主进程启动三者（子进程或线程）实现通信 |
+| 先实现生成器进程再实现碰撞器进程 | 生成器是碰撞侧数据源，接口稳定后再做碰撞与主进程编排 |
+| 派生地址生成规则 | 逻辑在开始构建时再给定，设计阶段仅占位 |
+| 助记词按 ID 递进、可回溯、确定性 | 同一 ID 固定得到同一助记词顺序，便于重放与分布式 |
+| 助记词表 | assets/wordlist/bip39_en.txt（BIP39 英文 2048 词）已准备 |
+| account/index 候选 | 由命令 gen-derivation-candidates 生成，输出 assets/derivation_candidates/derivation_candidates.txt |
+| 布谷鸟：只存地址+ID | 地址入过滤器，私钥仅存 ID 便于重算，可丢弃私钥以最大化内存给过滤器 |
+| 布谷鸟：命名=ID 范围 | 分片命名如 cuckoo_00000000-00999999.bin，索引即 ID 范围 |
+| 布谷鸟：0.001% 误判 | f≥20 bits 指纹，约 2.6 bytes/地址，1000 万地址≈26 MB/分片 |
+| 布谷鸟：落盘 | 分片满且该分片 ID 范围算完后落盘一次 |
+| 布谷鸟：内存淘汰 | 内存达上限时释放最早分片内存并删除其已落盘文件（FIFO） |
+| 布谷鸟：磁盘淘汰 | 磁盘达上限时删除最早落盘文件（FIFO），用内存保证可用性 |
+| 布谷鸟：启动 | 启动时加载所有已落盘可读的过滤器，从下一 ID 继续生成 |
+| 布谷鸟：检查点 | 由落盘过滤器及文件名管理；重启后读文件名得 ID 范围，下一 ID = max(end_id)+1 |
+| 生成器种子 key | 单独配置文件路径（如 generator_seed.key），与 ID 共同生成键值对，每台机不同种子→起点不同 |
 
 ## Errors Encountered
+
 | Error | Attempt | Resolution |
 |-------|---------|------------|
-| （待实施后按需填写） |         |            |
+| （暂无） |         |            |
+
+## 待解决问题（数据存储）
+
+| 问题 | 描述 | 状态 |
+|------|------|------|
+| **链上地址碰撞 → 布谷鸟过滤器** | 用链上获取的地址与生成地址碰撞，碰撞结果/中间数据需要写入**布谷鸟过滤器**（支持持续更新）；存储格式、容量与持久化方案待定。 | 待解决 |
+| **生成地址碰撞 → BinaryFuse 过滤器** | 用生成出来的地址去碰撞** BinaryFuse 过滤器**（如 fetcher 的 filter）；查询与批量碰撞的读写方式、与生成器布谷鸟的配合方式待定。 | 待解决 |
+
+## 三组件可执行命令（CLI）
+
+| 命令 | 说明 | 状态 |
+|------|------|------|
+| `birdhash init` | 创建 data、assets 等目录 | 已实现 |
+| **获取器（独立进程）** | | |
+| `birdhash fetch [--batch ...] [--rpc URL]` | 获取器进程：拉块、写地址过滤器等 | 已实现 |
+| `birdhash build-filter [--batch ...]` | 从已拉块构建 BinaryFuse 过滤器 | 已实现 |
+| **生成器（独立进程）** | | |
+| `birdhash gen-derivation-candidates [--output PATH]` | 生成 index 候选，默认 `assets/derivation_candidates/derivation_candidates.txt` | 已实现 |
+| `birdhash init-generator-seed [--seed PATH]` | 生成/检查生成器种子 key，每台机可独立起点 | 待实现 |
+| `birdhash generate [--config CONFIG]` | **生成器进程**：加载种子 key + 已落盘布谷鸟，从下一 ID 继续，单行进度，落盘与淘汰 | 待实现 |
+| **碰撞器（独立进程）** | | |
+| `birdhash collide [--config CONFIG]` | **碰撞器进程**：读 fetcher 过滤器与生成器布谷鸟，碰撞并写 hits | 待实现 |
+| **主进程编排（可选）** | | |
+| `birdhash run [--config CONFIG]` | 主进程启动获取器、生成器、碰撞器（三子进程或三线程），负责数据通信与生命周期 | 待定 |
+
+以上为**可直接执行的命令行**；生成器、碰撞器、获取器均以**独立进程**运行，可选由主进程统一启动三者并实现数据通信。
 
 ## Notes
-- 现有 Fetcher 中与 filter、AddressStore、archive（BHFA）、new_addrs 相关的逻辑均在 Phase 10 中从获取器移除或改为「仅写原始块」。
-- Phase 11 为后续计划，仅在此记录目标：碰撞器（或独立流水线）读原始块 → 生成 filter_fetch / all_addrs / new_addrs 等供 Collider 使用。
-- 更新 phase 状态：pending → in_progress → complete；重大决策前重读本计划。
+
+- SPEC.md 中 Generator 原为 seed+counter → BinaryFuse8；本次改为助记词+派生路径+布谷鸟+种子 key，与 SPEC 有差异，在 findings 中说明。
+- 生成器进程：单行刷新（`\r` + 同一条行），不滚屏，显示 ID / 前3词... / account id / index id。
+- 布谷鸟参数：b=4、指纹 f≥20、负载 α≈0.955；可配置 shard_capacity、cuckoo_max_memory_mb、cuckoo_max_disk_mb；可配置 generator_seed_path。

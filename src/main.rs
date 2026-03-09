@@ -1,27 +1,17 @@
-mod archive;
-mod collider;
 mod config;
-mod cursor;
+mod derivation;
 mod fetcher;
 mod filter;
-mod generator;
 #[allow(dead_code)]
 mod keygen;
-mod lifecycle;
-mod scanner;
-mod stats;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::Write;
+use xorf::Filter;
 
 #[derive(Parser)]
-#[command(
-    name = "birdhash",
-    version,
-    about = "Ethereum address collision detector with 3-tier storage"
-)]
+#[command(name = "birdhash", version, about = "Ethereum block fetcher and address filter")]
 struct Cli {
-    /// Path to config.toml (default: config.toml in current dir)
     #[arg(short, long, default_value = "config.toml")]
     config: String,
     #[command(subcommand)]
@@ -30,14 +20,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize master seed and data directories
+    /// Create data and fetcher directories
     Init,
-    /// Run deterministic key generator (seed+counter → BinaryFuse8 L1)
-    Generate {
-        #[arg(short, long)]
-        threads: Option<usize>,
-    },
-    /// Fetch raw blocks by batch: 1=1..100000, 2=100001..200000, ... Multiple batches run in parallel (threads).
+    /// Fetch raw blocks by batch: 1=1..100000, 2=100001..200000, ... Omit = latest batch (with poll loop if poll_interval_secs>0).
     Fetch {
         /// Batch index (1-based). Multiple: --batch 1 2 3 4 or --batch 1,2,3,4. Single/omit = latest batch.
         #[arg(long, num_args(1..), value_delimiter(','))]
@@ -49,53 +34,36 @@ enum Commands {
         #[arg(long)]
         output_dir: Option<String>,
     },
-    /// Test fetcher: fetch one block and print block info, transactions, and extracted addresses
+    /// 从已拉取的块数据构建地址过滤器（BinaryFuse16）。无参则扫描全量批次逐批构建；--batch 可多批合并为一个 filter。输出 filter.{id}-{id}.bin + 元信息。
+    BuildFilter {
+        /// 批 ID，与 Fetch 一致。可多个合并：--batch 1 2 3 4。不传则构建数据目录下全部批次（各一个 filter）
+        #[arg(long, num_args(0..), value_delimiter(','))]
+        batch: Option<Vec<u64>>,
+        /// 过滤器输出目录（默认: data/fetcher）
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// 查询地址是否在获取器过滤器中：输入地址，输出 0=不存在 1=存在
+    FilterQuery {
+        /// 以太坊地址（0x 开头或 40 位十六进制）
+        #[arg(required = true)]
+        address: String,
+        /// 过滤器文件路径（默认: data/fetcher/filter_fetch.bin）
+        #[arg(long)]
+        filter: Option<String>,
+    },
+    /// Fetch one block and print block info, transactions, extracted addresses
     FetchTest {
         #[arg(short, long)]
         rpc: Option<String>,
-        /// Block number (default: latest)
         #[arg(short, long)]
         block: Option<u64>,
     },
-    /// Run bidirectional collision (L1/L2 filter + batch regenerate verify)
-    Collide {
-        /// Local regenerate-range mode (L3): specify START END
-        #[arg(long, num_args = 2, value_names = ["START", "END"])]
-        regenerate_range: Option<Vec<u64>>,
-    },
-    /// Show 3-tier storage status, shard counts, disk usage
-    Status,
-    /// Manage disk lifecycle: L1→L2 downgrade (--archive) / L2→L3 purge
-    Purge {
-        /// Keep last N shards (default: 0 = purge all eligible)
-        #[arg(long, default_value = "0")]
-        keep_last: usize,
-        /// L1→L2 archive mode (default: L2→L3 purge)
+    /// 生成派生路径 index 候选并写入 assets/derivation_candidates/（account 取 0-111，index 取该文件所列值）
+    GenDerivationCandidates {
+        /// 输出文件路径（默认: assets/derivation_candidates/derivation_candidates.txt）
         #[arg(long)]
-        archive: bool,
-    },
-    /// Distributed L3 scan: split counter range into task files
-    ScanDistribute {
-        #[arg(long, num_args = 2, value_names = ["START", "END"])]
-        range: Vec<u64>,
-        #[arg(long, default_value = "10000000000")]
-        chunk_size: u64,
-        #[arg(long)]
-        fetch_addrs: String,
-        #[arg(long, default_value = "data/tasks")]
-        out: String,
-    },
-    /// Distributed L3 scan: worker processes a single task
-    ScanWorker {
-        #[arg(long)]
-        task: String,
-        #[arg(long, default_value = "data/tasks")]
-        output: String,
-    },
-    /// Distributed L3 scan: collect and merge results
-    ScanCollect {
-        #[arg(long, default_value = "data/tasks")]
-        results_dir: String,
+        output: Option<String>,
     },
 }
 
@@ -105,171 +73,21 @@ fn main() -> Result<()> {
     let cfg = load_config(&cli);
     match cli.command {
         Commands::Init => cmd_init(cfg),
-        Commands::Status => cmd_status(cfg),
-        Commands::Generate { threads } => cmd_generate(cfg, threads),
         Commands::Fetch { batch, rpc, output_dir } => cmd_fetch(cfg, batch.as_deref(), rpc, output_dir, &cli.config),
+        Commands::BuildFilter { batch, output } => cmd_build_filter(cfg, batch.as_deref(), output.as_deref()),
+        Commands::FilterQuery { address, filter } => cmd_filter_query(cfg, &address, filter.as_deref()),
         Commands::FetchTest { rpc, block } => cmd_fetch_test(cfg, rpc, block),
-        Commands::Collide { regenerate_range } => cmd_collide(cfg, regenerate_range),
-        Commands::Purge { keep_last, archive } => cmd_purge(cfg, keep_last, archive),
-        Commands::ScanDistribute {
-            range,
-            chunk_size,
-            fetch_addrs,
-            out,
-        } => cmd_scan_distribute(cfg, &range, chunk_size, &fetch_addrs, &out),
-        Commands::ScanWorker { task, output } => cmd_scan_worker(&task, &output),
-        Commands::ScanCollect { results_dir } => cmd_scan_collect(cfg, &results_dir),
+        Commands::GenDerivationCandidates { output } => cmd_gen_derivation_candidates(cfg, output.as_deref()),
     }
 }
 
 fn load_config(cli: &Cli) -> config::AppConfig {
-    let path = std::path::Path::new(&cli.config);
-    let cfg = config::AppConfig::load(path);
-    log::info!(
-        "config: data_dir={} shard_size={} threads={}",
-        cfg.data_dir.display(),
-        cfg.shard_size,
-        cfg.threads
-    );
-    cfg
+    config::AppConfig::load(std::path::Path::new(&cli.config))
 }
 
 fn cmd_init(cfg: config::AppConfig) -> Result<()> {
     cfg.ensure_dirs()?;
-    let seed = keygen::load_or_create_seed(&cfg.master_seed_path())?;
-    let seed_hash = keygen::seed_hash_id(&seed);
-    let gen_path = cfg.gen_cursor_path();
-    if !gen_path.exists() {
-        let cur = cursor::GeneratorCursor {
-            master_seed_hash: seed_hash.clone(),
-            ..Default::default()
-        };
-        cursor::save_cursor(&cur, &gen_path)?;
-    }
-    println!("birdhash initialized");
-    println!("  seed hash:  {}", seed_hash);
-    println!("  data dir:   {}", cfg.data_dir.display());
-    println!(
-        "  shard size: {} ({:.0} 亿)",
-        cfg.shard_size,
-        cfg.shard_size as f64 / 1e8
-    );
-    println!("  threads:    {}", cfg.threads);
-    Ok(())
-}
-
-fn cmd_generate(mut cfg: config::AppConfig, threads: Option<usize>) -> Result<()> {
-    if let Some(t) = threads {
-        cfg.threads = t;
-    }
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(cfg.threads)
-        .build_global()
-        .ok();
-    cfg.ensure_dirs()?;
-    let seed = keygen::load_or_create_seed(&cfg.master_seed_path())?;
-    let seed_hash = keygen::seed_hash_id(&seed);
-    let mut cur: cursor::GeneratorCursor = cursor::load_or_default(&cfg.gen_cursor_path());
-    if cur.master_seed_hash.is_empty() {
-        cur.master_seed_hash = seed_hash.clone();
-    }
-    anyhow::ensure!(
-        cur.master_seed_hash == seed_hash,
-        "seed hash mismatch: cursor={} vs seed={}",
-        cur.master_seed_hash,
-        seed_hash
-    );
-    let mut gen = generator::Generator::new(cfg, cur, seed);
-    gen.load_fetch_filter()?;
-    gen.run()
-}
-
-fn cmd_collide(cfg: config::AppConfig, regenerate_range: Option<Vec<u64>>) -> Result<()> {
-    cfg.ensure_dirs()?;
-    let seed = keygen::load_or_create_seed(&cfg.master_seed_path())?;
-    let col_cur: cursor::ColliderCursor = cursor::load_or_default(&cfg.collider_cursor_path());
-    let mut c = collider::Collider::new(cfg, col_cur, seed);
-    if let Some(range) = regenerate_range {
-        anyhow::ensure!(
-            range.len() == 2,
-            "regenerate-range needs exactly 2 values: START END"
-        );
-        c.regenerate_range(range[0], range[1])
-    } else {
-        c.run()
-    }
-}
-
-fn cmd_purge(cfg: config::AppConfig, keep_last: usize, archive: bool) -> Result<()> {
-    cfg.ensure_dirs()?;
-    let seed = keygen::load_or_create_seed(&cfg.master_seed_path())?;
-    if archive {
-        lifecycle::downgrade_l1_to_l2(&cfg, &seed, keep_last)?;
-    } else {
-        lifecycle::purge_l2_to_l3(&cfg, keep_last)?;
-    }
-    let (l1, l2) = lifecycle::disk_usage(&cfg);
-    println!(
-        "Disk: L1={:.2} GB  L2={:.2} GB  total={:.2} GB",
-        l1 as f64 / 1e9,
-        l2 as f64 / 1e9,
-        (l1 + l2) as f64 / 1e9
-    );
-    Ok(())
-}
-
-fn cmd_scan_distribute(
-    cfg: config::AppConfig,
-    range: &[u64],
-    chunk_size: u64,
-    fetch_addrs: &str,
-    out: &str,
-) -> Result<()> {
-    anyhow::ensure!(range.len() == 2, "range needs exactly 2 values: START END");
-    let seed = keygen::load_or_create_seed(&cfg.master_seed_path())?;
-    let seed_hex = hex::encode(seed);
-    let fetch_count = if std::path::Path::new(fetch_addrs).exists() {
-        fetcher::load_new_addrs(std::path::Path::new(fetch_addrs))
-            .map(|a| a.len() as u64)
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    scanner::distribute(
-        range[0],
-        range[1],
-        chunk_size,
-        &seed_hex,
-        fetch_addrs,
-        fetch_count,
-        out,
-    )?;
-    Ok(())
-}
-
-fn cmd_scan_worker(task_path: &str, output: &str) -> Result<()> {
-    scanner::worker(task_path, output)?;
-    Ok(())
-}
-
-fn cmd_scan_collect(cfg: config::AppConfig, results_dir: &str) -> Result<()> {
-    let hits = scanner::collect(results_dir)?;
-    if !hits.is_empty() {
-        cfg.ensure_dirs()?;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(cfg.hits_path())?;
-        use std::io::Write;
-        for (counter, info) in &hits {
-            writeln!(f, "scan | counter={} | {}", counter, info)?;
-        }
-        println!(
-            "Appended {} hits to {}",
-            hits.len(),
-            cfg.hits_path().display()
-        );
-    }
+    println!("birdhash init: data_dir={}", cfg.data_dir.display());
     Ok(())
 }
 
@@ -291,18 +109,91 @@ fn cmd_fetch(cfg: config::AppConfig, batches: Option<&[u64]>, rpc_cli: Option<St
     };
     for &b in &batches { anyhow::ensure!(b >= 1 && b <= total_batches, "batch {} out of range 1..{}", b, total_batches); }
     if batches.len() > 1 {
-        run_fetch_multi(&batches, latest, total_batches, &out_root, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size)?;
+        run_fetch_multi(&batches, latest, total_batches, &out_root, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, cfg.fetcher_dir().as_path())?;
         return Ok(());
     }
     let batch = batches[0];
     let prefix = std::env::var("BIRDHASH_BATCH").ok().map(|b| format!("[batch={}] ", b)).unwrap_or_default();
     println!("{}latest={} total_batches={} batch={}", prefix, latest, total_batches, batch);
     let start_block = (batch - 1) * SEGMENT_SIZE + 1;
-    let end_block = (batch * SEGMENT_SIZE).min(latest);
-    fetcher::run_fetch_range(&out_root, start_block, end_block, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None)
+    let mut end_block = (batch * SEGMENT_SIZE).min(latest);
+    let fetcher_dir = cfg.fetcher_dir();
+    let filter_dir = if batch == total_batches { Some(fetcher_dir.as_path()) } else { None };
+    fetcher::run_fetch_range(&out_root, start_block, end_block, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None, filter_dir, false)?;
+    if batch == total_batches && cfg.poll_interval_secs > 0 {
+        loop {
+            print!("\r  batch={} height={} blocks={} (polling every {}s)   ", batch, end_block, end_block - (batch - 1) * SEGMENT_SIZE, cfg.poll_interval_secs);
+            let _ = std::io::stdout().flush();
+            std::thread::sleep(std::time::Duration::from_secs(cfg.poll_interval_secs));
+            let new_latest = pool.get_latest_block_number()?;
+            if new_latest <= end_block { continue; }
+            fetcher::run_fetch_range(&out_root, end_block + 1, new_latest, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None, filter_dir, true)?;
+            end_block = new_latest;
+        }
+    }
+    Ok(())
 }
 
-fn run_fetch_multi(batches: &[u64], latest: u64, total_batches: u64, out_root: &std::path::Path, rpc_urls: &[String], timeout_secs: u64, batch_size: usize) -> Result<()> {
+fn cmd_build_filter(cfg: config::AppConfig, batch: Option<&[u64]>, output: Option<&str>) -> Result<()> {
+    let range_root = cfg.fetcher_ranges_dir();
+    let out_dir = output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_dir());
+    let (count, entries) = match batch {
+        Some(ids) if !ids.is_empty() => {
+            let (c, e) = fetcher::build_fetch_filter_from_ranges(&range_root, Some(ids), &out_dir)?;
+            println!("BuildFilter done: {} filter(s), batches={} entries={}", c, ids.len(), e);
+            (c, e)
+        }
+        _ => {
+            let (c, e) = fetcher::build_fetch_filter_all_batches(&range_root, &out_dir)?;
+            println!("BuildFilter done: {} filter(s), total entries={}", c, e);
+            (c, e)
+        }
+    };
+    let _ = (count, entries);
+    Ok(())
+}
+
+fn cmd_filter_query(cfg: config::AppConfig, address: &str, filter_path: Option<&str>) -> Result<()> {
+    let addr = fetcher::parse_hex_addr(address.trim()).ok_or_else(|| anyhow::anyhow!("无效地址: {}", address))?;
+    let fp = filter::addr_to_u64(&addr);
+    let paths: Vec<std::path::PathBuf> = match filter_path {
+        Some(s) => {
+            let p = std::path::PathBuf::from(s);
+            if p.is_dir() {
+                let mut v: Vec<_> = std::fs::read_dir(&p)?.filter_map(|e| e.ok()).filter(|e| e.path().extension().map_or(false, |x| x == "bin")).map(|e| e.path()).collect();
+                v.sort();
+                v
+            } else {
+                if !p.exists() { anyhow::bail!("过滤器文件不存在: {}", p.display()); }
+                vec![p]
+            }
+        }
+        None => {
+            let dir = cfg.fetcher_dir();
+            if !dir.exists() { anyhow::bail!("fetcher 目录不存在: {}", dir.display()); }
+            let mut v: Vec<_> = std::fs::read_dir(&dir)?.filter_map(|e| {
+                let e = e.ok()?;
+                let name = e.file_name();
+                let n = name.to_string_lossy();
+                if n.starts_with("filter.") && n.ends_with(".bin") { Some(e.path()) } else { None }
+            }).collect();
+            v.sort();
+            v
+        }
+    };
+    anyhow::ensure!(!paths.is_empty(), "未找到任何 filter.*.bin 文件");
+    let mut filters: Vec<filter::BinaryFuse16> = Vec::with_capacity(paths.len());
+    for p in &paths {
+        let f = filter::load_fuse16(p)?;
+        filters.push(f);
+        eprintln!("loaded: {}", p.display());
+    }
+    let hit = filters.iter().any(|f| f.contains(&fp));
+    println!("{}", if hit { 1 } else { 0 });
+    Ok(())
+}
+
+fn run_fetch_multi(batches: &[u64], latest: u64, total_batches: u64, out_root: &std::path::Path, rpc_urls: &[String], timeout_secs: u64, batch_size: usize, fetcher_dir: &std::path::Path) -> Result<()> {
     use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
     use std::collections::HashMap;
     use std::sync::mpsc;
@@ -338,9 +229,12 @@ fn run_fetch_multi(batches: &[u64], latest: u64, total_batches: u64, out_root: &
         let out = out_root.to_path_buf();
         let urls = rpc_urls.to_vec();
         let tx_send = progress_tx.clone();
+        let fdir = fetcher_dir.to_path_buf();
+        let tot = total_batches;
         handles.push(thread::spawn(move || {
             let prog = Some((b, tx_send));
-            fetcher::run_fetch_range(&out, start_block, end_block, &urls, timeout_secs, batch_size, None, prog)
+            let filter_dir = if b == tot { Some(fdir.as_path()) } else { None };
+            fetcher::run_fetch_range(&out, start_block, end_block, &urls, timeout_secs, batch_size, None, prog, filter_dir, false)
         }));
     }
     drop(progress_tx);
@@ -364,6 +258,13 @@ fn resolve_rpc_urls(cfg: &config::AppConfig, rpc_cli: Option<String>) -> Result<
         anyhow::bail!("no RPC URL. Use --rpc <URL> or set [fetcher].rpc_url / rpc_urls in config.toml");
     };
     Ok(urls)
+}
+
+fn cmd_gen_derivation_candidates(cfg: config::AppConfig, output: Option<&str>) -> Result<()> {
+    let out_path = output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.derivation_candidates_path());
+    let n = derivation::run_gen_derivation_candidates(&out_path)?;
+    println!("wrote {} candidates -> {}", n, out_path.display());
+    Ok(())
 }
 
 fn cmd_fetch_test(cfg: config::AppConfig, rpc_cli: Option<String>, block_arg: Option<u64>) -> Result<()> {
@@ -407,11 +308,5 @@ fn cmd_fetch_test(cfg: config::AppConfig, rpc_cli: Option<String>, block_arg: Op
     for (i, hex_addr) in sorted.into_iter().enumerate() {
         println!("  {}  0x{}", i + 1, hex_addr);
     }
-    Ok(())
-}
-
-fn cmd_status(cfg: config::AppConfig) -> Result<()> {
-    let s = stats::gather_status(&cfg)?;
-    stats::print_status(&s);
     Ok(())
 }

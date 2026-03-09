@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub data_dir: PathBuf,
+    /// 助记词表与派生候选等资源目录（不在 data 下）
+    pub assets_dir: PathBuf,
     pub shard_size: u64,
     pub l1_disk_ratio: f64,
     pub disk_watermark: f64,
@@ -26,6 +28,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("data"),
+            assets_dir: PathBuf::from("assets"),
             shard_size: 1_000_000_000,
             l1_disk_ratio: 0.6,
             disk_watermark: 0.8,
@@ -52,6 +55,7 @@ struct TomlConfig {
 #[derive(serde::Deserialize, Default)]
 struct TomlGeneral {
     data_dir: Option<String>,
+    assets_dir: Option<String>,
     threads: Option<usize>,
 }
 #[derive(serde::Deserialize, Default)]
@@ -130,16 +134,21 @@ impl AppConfig {
         self.fetcher_dir().join("ranges")
     }
 
+    /// 派生路径 index 候选文件（assets/derivation_candidates/derivation_candidates.txt）
+    pub fn derivation_candidates_path(&self) -> PathBuf {
+        self.assets_dir.join("derivation_candidates").join("derivation_candidates.txt")
+    }
+    /// 助记词表路径（assets/wordlist/bip39_en.txt）
+    pub fn wordlist_path(&self) -> PathBuf {
+        self.assets_dir.join("wordlist").join("bip39_en.txt")
+    }
+
     pub fn ensure_dirs(&self) -> anyhow::Result<()> {
-        for d in [
-            self.generator_dir(),
-            self.fetcher_dir(),
-            self.results_dir(),
-            self.tasks_dir(),
-            self.archive_dir(),
-        ] {
-            std::fs::create_dir_all(&d)?;
-        }
+        std::fs::create_dir_all(&self.data_dir)?;
+        std::fs::create_dir_all(self.fetcher_dir())?;
+        std::fs::create_dir_all(self.fetcher_ranges_dir())?;
+        std::fs::create_dir_all(self.assets_dir.join("wordlist"))?;
+        std::fs::create_dir_all(self.assets_dir.join("derivation_candidates"))?;
         Ok(())
     }
 
@@ -156,6 +165,9 @@ impl AppConfig {
         if let Some(g) = toml.general {
             if let Some(d) = g.data_dir {
                 cfg.data_dir = PathBuf::from(d);
+            }
+            if let Some(a) = g.assets_dir {
+                cfg.assets_dir = PathBuf::from(a);
             }
             if let Some(t) = g.threads {
                 if t > 0 {
