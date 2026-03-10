@@ -2,33 +2,31 @@
 
 ## Requirements（来自用户）
 
-- **架构**：**获取器、生成器、碰撞器** 均为**独立进程**（各自 CLI）；可选由**主进程**统一启动三者（子进程或线程），实现数据通信。
-- **生成器**（独立进程，先设计）：
-  - 使用**助记词序列** + **派生路径规则**生成私钥与对应地址。
-  - **派生地址的生成规则**：路径 m / purpose' / coin_type' / account' / change / index。account 与 index 共用候选：在「正数1万、倒数1万」范围内，保留**从 0-9 中任取 1～3 个数（作为数码）组成的数**；脚本生成 derivation_candidates.txt，生成时直接使用。
-  - 助记词生成需**可回溯**、**确定性**，按 **ID 递进** 生成新的助记词顺序（ID 递增 → 确定性的下一个序列）。
-  - 需**准备助记词表**（已做：BIP39 英文 2048 词，见下）。
-  - 需**额外配置生成器种子 key 文件**，与 **ID** 共同生成 (privkey, address)，确保**每台机器启动时起点不同**；路径可配置（如 `generator_seed.key`）。
-  - 生成的地址放入**布谷鸟过滤器**（Cuckoo filter），因为需要**持续更新**过滤器中的地址。
-- **生成器进程打印**：不滚屏，单行刷新；打印当前计算的 ID、前 3 个助记词 + "..."、当前 account id、当前 index id，一行不滚，便于确认进程在运行。
-- 参考 birdhash/SPEC.md，但**不会采用全部**（例如不沿用原 SPEC 的 L1 BinaryFuse8 + L2 Bloom 分级，改为布谷鸟以支持增删）。
-- 先写计划与设计，再往里添加实现细节。
+- **架构**：**获取器、生成器、碰撞器** 均为**独立进程**；**获取器内存 BinaryFuse 通过共享内存提供给生成器与碰撞器**；放弃原三级存储（L1/L2/L3）。
+- **生成器**（独立进程，**仅助记词模式**，移除原 keygen）：
+  - 使用**助记词序列** + **派生路径规则**生成私钥与对应地址；**purpose / coin_type / change 可配置，使用默认值**。
+  - **(种子 + ID)** 的生成方式得到**乱序的助记词**（确定性但非顺序枚举），确保每台机起点不同且打散。
+  - 派生路径 m / purpose' / coin_type' / account' / change / index；account 0-111，index 从 assets/derivation_candidates 读取（由 init 集成生成）。
+  - 生成的地址放入**布谷鸟过滤器**；新地址追加写 data/generator/out_addrs.bin 供碰撞器读。
+- **碰撞器**：与**共享内存**通信（读 BinaryFuse）；与**获取器**通信获得**更新进来的新地址**（data/fetcher/new_addrs.bin）；**新链上地址与布谷鸟碰撞**；**生成器新地址与 BinaryFuse 碰撞**；命中写 hits。
+- **init**：**生成 index 候选**与**生成种子**均集成到 `birdhash init` 中。
+- **生成器进程打印**：不滚屏，单行刷新；当前 ID、前 3 助记词+"..."、account id、index id。
 
 ## 与 SPEC.md 的对照
 
 | SPEC 内容 | 是否采用 | 说明 |
 |-----------|----------|------|
 | Generator 用 seed+counter → BinaryFuse8 | 否 | 改为助记词+派生路径，过滤器改为布谷鸟 |
-| 三级存储 L1/L2/L3 | 待定 | 首阶段可能只做「生成器过滤器 + 碰撞」单层，后续再考虑分级 |
-| Fetcher BinaryFuse16 | 是 | 获取器已实现，碰撞器读取现有 filter.*.bin |
-| 双向碰撞 gen→fetch / fetch→gen | 是 | 目标不变，实现方式随生成器改动 |
-| keygen 模块 HMAC-SHA256 + counter | 待定 | 若保留可与助记词路径并存（两套生成源） |
+| 三级存储 L1/L2/L3 | **否** | 放弃原方案 |
+| Fetcher BinaryFuse16 | 是 | 获取器写入**共享内存**，生成器与碰撞器只读 |
+| 双向碰撞 gen→fetch / fetch→gen | 是 | 碰撞器：新链上地址 vs 布谷鸟；生成器新地址 vs BinaryFuse |
+| keygen 模块 HMAC-SHA256 + counter | **否** | 生成器仅助记词模式，移除原 keygen |
 
 ## Research Findings
 
 - **布谷鸟过滤器**：支持插入与删除，适合「持续更新」；误判率 ε ≤ b/2^(f−1)，空间约 (log₂(1/ε)+1+log₂b)/α bits/元素（α≈0.955）。0.001% 误判需 f≥20 bits，约 2.6 bytes/地址。Rust 有 `cuckoofilter` 等 crate，地址 20 字节可哈希取指纹。
 - **BIP39/BIP32/BIP44**：助记词 → seed → 分层确定性密钥；以太坊常用 m/44'/60'/0'/0/account_index。
-- **助记词序列**：按 **ID** 确定性、可回溯地生成「助记词顺序」；ID 递进则得到下一个序列。同一 ID 永远得到同一序列，便于重放与断点。
+- **助记词序列**：**(种子 + ID)** 得到**乱序助记词**（确定性、可回溯，但非顺序枚举）；同一 (种子,ID) 得到同一序列。
 - **助记词表**：已准备 `birdhash/assets/wordlist/bip39_en.txt`，BIP39 英文 2048 词，一行一词；生成时按该表枚举。
 - **派生地址生成规则**：m / purpose' / coin_type' / account' / change / index；account 与 index 共用候选，范围为「正数1万」+「倒数1万」，筛选条件为从 0-9 中任取 1～3 个数（数码）组成的数；脚本输出 data/derivation_candidates/derivation_candidates.txt。
 
@@ -43,7 +41,15 @@
 | 助记词表 assets/wordlist/bip39_en.txt | BIP39 英文 2048 词，确定性枚举助记词序列的词汇来源 |
 | account 取值范围 | 0-111（含 111） |
 | index 取值范围 | 由命令 `birdhash gen-derivation-candidates` 生成的文件 derivation_candidates.txt 中所列之值（一行一个） |
-| index 候选生成 | 项目内命令 `birdhash gen-derivation-candidates`（Rust），输出 assets/derivation_candidates/derivation_candidates.txt；不再依赖 Python 脚本 |
+| 放弃三级存储 | 不再采用 L1/L2/L3 |
+| 生成器仅助记词模式 | 移除原 keygen（HMAC-SHA256+counter） |
+| 种子+ID → 乱序助记词 | 确定性但乱序，非顺序枚举 |
+| purpose/coin_type/change | 可配置，使用默认值 |
+| 通信：共享内存 BinaryFuse | 获取器写，生成器与碰撞器只读 |
+| 通信：文件 new_addrs / out_addrs | 获取器→碰撞器新链上地址；生成器→碰撞器新地址；碰撞器增量读 |
+| 通信：布谷鸟 | 生成器写磁盘，碰撞器从磁盘加载 |
+| init 集成 | 生成 index 候选 + 生成种子 均集成到 birdhash init |
+| index 候选生成 | 由 init 集成，输出 assets/derivation_candidates/derivation_candidates.txt |
 | 生成器进程输出 | 单行刷新不滚屏：当前 ID、前3助记词+省略号、account id、index id |
 | 布谷鸟：只存地址+ID | 生成 (privkey,address) 时地址入过滤器，私钥仅保留 ID 便于命中后重算，不存私钥以最大化内存 |
 | 布谷鸟：命名=ID 范围 | 分片文件命名即 ID 范围，如 cuckoo_00000000-00999999.bin；索引=该范围 |
@@ -66,21 +72,25 @@
 - **启动**：生成器启动时**加载所有已落盘且可读的布谷鸟过滤器**，然后从**下一 ID** 继续生成。
 - **检查点**：**不单独存检查点**；由**落盘过滤器 + 文件名**管理：重启后**读目录下 cuckoo_*.bin 文件名**，解析 ID 范围，**下一生成 ID = max(end_id) + 1**。
 
+## 三组件通信方案（具体）
+
+- **共享内存**：BinaryFuse 由获取器写入共享内存（如 POSIX shm / mmap），生成器与碰撞器只读挂载；更新时需双缓冲或版本/锁避免读端看到中间状态。
+- **获取器 → 碰撞器（新链上地址）**：获取器追加写 `data/fetcher/new_addrs.bin`（20 字节/地址），碰撞器按偏移或长度增量读取，与布谷鸟（从磁盘加载）碰撞。
+- **生成器 → 碰撞器（新生成地址）**：生成器追加写 `data/generator/out_addrs.bin`，碰撞器增量读取，与 BinaryFuse（共享内存）碰撞。
+- **布谷鸟**：生成器写 cuckoo_*.bin 到磁盘；碰撞器从磁盘加载布谷鸟分片做 fetch→gen 查询。
+
 ## 三组件可执行命令（CLI）
 
-- **获取器（独立进程）**：`birdhash fetch`、`birdhash build-filter`（已实现）。
-- **生成器（独立进程）**：`birdhash gen-derivation-candidates`（已实现）、`birdhash init-generator-seed`（待实现）、`birdhash generate`（待实现）。
-- **碰撞器（独立进程）**：`birdhash collide`（待实现）。
-- **主进程编排（可选）**：`birdhash run` 启动三者（三子进程或三线程），实现数据通信（待定）。
+- `birdhash init`：创建目录 + **集成**生成 index 候选 + 生成/检查种子（待调整）。
+- **获取器**：`birdhash fetch`、`birdhash build-filter`（BinaryFuse 写入共享内存，待接）。
+- **生成器**：`birdhash generate`（只读共享内存 BinaryFuse，种子+ID→乱序助记词，写 out_addrs.bin）。
+- **碰撞器**：`birdhash collide`（读共享内存、new_addrs、out_addrs，从磁盘加载布谷鸟，写 hits）。
 
-是否用主进程启动三组件：可以。方案 A = 主进程 spawn 三子进程，通过共享目录或 IPC 通信；方案 B = 主进程内三线程，通过 channel/共享结构通信。
-
-## 待解决问题（数据存储）
+## 待解决问题（若有）
 
 | 问题 | 描述 |
 |------|------|
-| **链上地址碰撞 → 布谷鸟过滤器** | 用链上获取的地址与生成地址碰撞后，结果/中间数据需写入布谷鸟过滤器（支持持续更新）；存储格式、容量与持久化待定。 |
-| **生成地址碰撞 → BinaryFuse 过滤器** | 用生成出来的地址去碰撞 BinaryFuse 过滤器（如 fetcher 的 filter）；查询与批量碰撞的读写方式、与生成器侧布谷鸟的配合待定。 |
+| BinaryFuse 更新一致性 | 获取器更新共享内存时读端一致性；双缓冲或版本/锁 |
 
 ## Issues Encountered
 
