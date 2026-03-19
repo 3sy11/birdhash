@@ -35,6 +35,9 @@ enum Commands {
     BuildFilter {
         #[arg(long, num_args(0..), value_delimiter(','))]
         batch: Option<Vec<u64>>,
+        /// 指定 data 目录（默认用 config 的 data_dir），ranges=data/fetcher/ranges，BF 输出到 data/fetcher
+        #[arg(long)]
+        data_dir: Option<String>,
         #[arg(long)]
         source: Option<String>,
         #[arg(long)]
@@ -53,11 +56,6 @@ enum Commands {
         rpc: Option<String>,
         #[arg(short, long)]
         block: Option<u64>,
-    },
-    /// 生成派生路径候选
-    GenDerivationCandidates {
-        #[arg(long)]
-        output: Option<String>,
     },
     /// 碰撞器：N 线程生成地址，实时与 BF 碰撞，命中写 CSV，支持断点续碰
     Collide {
@@ -83,10 +81,9 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(cfg),
         Commands::Fetch { batch, rpc, output_dir } => cmd_fetch(cfg, batch.as_deref(), rpc, output_dir, &cli.config),
-        Commands::BuildFilter { batch, source, output } => cmd_build_filter(cfg, batch.as_deref(), source.as_deref(), output.as_deref()),
+        Commands::BuildFilter { batch, data_dir, source, output } => cmd_build_filter(cfg, batch.as_deref(), data_dir.as_deref(), source.as_deref(), output.as_deref()),
         Commands::FilterQuery { address, filter } => cmd_filter_query(cfg, &address, filter.as_deref()),
         Commands::FetchTest { rpc, block } => cmd_fetch_test(cfg, rpc, block),
-        Commands::GenDerivationCandidates { output } => cmd_gen_derivation_candidates(cfg, output.as_deref()),
         Commands::Collide { threads } => cmd_collide(cfg, threads),
         Commands::IdInfo { id, all } => cmd_id_info(cfg, id, all),
     }
@@ -121,7 +118,7 @@ fn cmd_fetch(cfg: config::AppConfig, batches: Option<&[u64]>, rpc_cli: Option<St
     };
     for &b in &batches { anyhow::ensure!(b >= 1 && b <= total_batches, "batch {} out of range 1..{}", b, total_batches); }
     if batches.len() > 1 {
-        run_fetch_multi(&batches, latest, total_batches, &out_root, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, cfg.fetcher_dir().as_path())?;
+        run_fetch_multi(&batches, latest, total_batches, &out_root, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size)?;
         return Ok(());
     }
     let batch = batches[0];
@@ -129,9 +126,7 @@ fn cmd_fetch(cfg: config::AppConfig, batches: Option<&[u64]>, rpc_cli: Option<St
     println!("{}latest={} total_batches={} batch={}", prefix, latest, total_batches, batch);
     let start_block = (batch - 1) * SEGMENT_SIZE + 1;
     let mut end_block = (batch * SEGMENT_SIZE).min(latest);
-    let fetcher_dir = cfg.fetcher_dir();
-    let filter_dir = if batch == total_batches { Some(fetcher_dir.as_path()) } else { None };
-    fetcher::run_fetch_range(&out_root, start_block, end_block, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None, filter_dir, false)?;
+    fetcher::run_fetch_range(&out_root, start_block, end_block, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None, false)?;
     if batch == total_batches && cfg.poll_interval_secs > 0 {
         loop {
             print!("\r  batch={} height={} blocks={} (polling every {}s)   ", batch, end_block, end_block - (batch - 1) * SEGMENT_SIZE, cfg.poll_interval_secs);
@@ -139,73 +134,135 @@ fn cmd_fetch(cfg: config::AppConfig, batches: Option<&[u64]>, rpc_cli: Option<St
             std::thread::sleep(std::time::Duration::from_secs(cfg.poll_interval_secs));
             let new_latest = pool.get_latest_block_number()?;
             if new_latest <= end_block { continue; }
-            fetcher::run_fetch_range(&out_root, end_block + 1, new_latest, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None, filter_dir, true)?;
+            fetcher::run_fetch_range(&out_root, end_block + 1, new_latest, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None, true)?;
             end_block = new_latest;
         }
     }
     Ok(())
 }
 
-fn cmd_build_filter(cfg: config::AppConfig, batch: Option<&[u64]>, source: Option<&str>, output: Option<&str>) -> Result<()> {
-    let range_root = source.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_ranges_dir());
-    let out_dir = output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_dir());
-    let (count, entries) = match batch {
-        Some(ids) if !ids.is_empty() => {
-            let (c, e) = fetcher::build_fetch_filter_from_ranges(&range_root, Some(ids), &out_dir)?;
-            println!("BuildFilter done: {} filter(s), batches={} entries={}", c, ids.len(), e);
-            (c, e)
-        }
-        _ => {
-            let (c, e) = fetcher::build_fetch_filter_all_batches(&range_root, &out_dir)?;
-            println!("BuildFilter done: {} filter(s), total entries={}", c, e);
-            (c, e)
-        }
+fn cmd_build_filter(cfg: config::AppConfig, batch: Option<&[u64]>, data_dir: Option<&str>, source: Option<&str>, output: Option<&str>) -> Result<()> {
+    use crate::filter;
+    use std::io::BufRead;
+    let (range_root, out_dir) = if let Some(d) = data_dir {
+        let base = std::path::PathBuf::from(d);
+        (base.join("fetcher").join("ranges"), base.join("fetcher"))
+    } else {
+        (source.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_ranges_dir()), output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_dir()))
     };
-    let _ = (count, entries);
+    std::fs::create_dir_all(&out_dir)?;
+
+    // 读取 meta，确认「当前正在写入」的批次，不合并该批次的 chunk
+    let meta = fetcher::load_meta(&range_root).unwrap_or_default();
+    let current_batch = meta.current_batch;
+    let current_batch_through = meta.current_batch_fetched_through_block;
+    let current_batch_seg_end = current_batch * fetcher::SEGMENT_SIZE - 1;
+    // 当前批次未写满时不合并其 chunk
+    let current_batch_done = current_batch_through >= current_batch_seg_end;
+
+    // 确定要处理的批次列表
+    let all_batches = fetcher::list_batches_in_ranges(&range_root)?;
+    anyhow::ensure!(!all_batches.is_empty(), "no batches found under {}", range_root.display());
+    let batch_list: Vec<u64> = match batch {
+        Some(ids) if !ids.is_empty() => {
+            for &id in ids { anyhow::ensure!(all_batches.contains(&id), "batch {} not found in ranges", id); }
+            ids.to_vec()
+        }
+        _ => all_batches.clone(),
+    };
+
+    // 第一步：合并各批次的小文件（排除「当前写入中」的批次）
+    let mut merged_count = 0usize;
+    for &bid in &batch_list {
+        let is_current = bid == current_batch && !current_batch_done;
+        if is_current {
+            println!("  batch={} 跳过合并（当前写入中，through={}/{}）", bid, current_batch_through, current_batch_seg_end);
+            continue;
+        }
+        let seg_s = (bid.saturating_sub(1)) * fetcher::SEGMENT_SIZE;
+        let range_dir = range_root.join(fetcher::seg_dir_name(seg_s));
+        let has_chunks = (0..100u32).any(|i| range_dir.join(format!("chunk_{:03}.jsonl", i)).exists());
+        if has_chunks {
+            let lines = fetcher::merge_range_dir(&range_dir)?;
+            println!("  batch={} 合并完成，共 {} 行", bid, lines);
+            merged_count += 1;
+        }
+    }
+    if merged_count > 0 { println!("合并了 {} 个批次的小文件", merged_count); }
+
+    // 第二步：从所有可读取的批次（只读 blocks.jsonl）收集指纹，生成 BF
+    // 当前写入中的批次只有 chunk，不读入 BF（保持 BF 一致性）
+    let mut set1 = std::collections::HashSet::<u64>::new();
+    let mut set2 = std::collections::HashSet::<u64>::new();
+    let mut set3 = std::collections::HashSet::<u64>::new();
+    let mut included_batches: Vec<u64> = Vec::new();
+    for &bid in &batch_list {
+        let is_current_writing = bid == current_batch && !current_batch_done;
+        if is_current_writing { continue; }
+        let seg_s = (bid.saturating_sub(1)) * fetcher::SEGMENT_SIZE;
+        let range_dir = range_root.join(fetcher::seg_dir_name(seg_s));
+        let blocks_path = range_dir.join("blocks.jsonl");
+        if !blocks_path.exists() { continue; }
+        let f = std::fs::File::open(&blocks_path)?;
+        for line in std::io::BufReader::new(f).lines() {
+            let line = line?;
+            if line.trim().is_empty() { continue; }
+            let block: serde_json::Value = serde_json::from_str(&line)?;
+            for addr in fetcher::extract_addresses_from_block(&block) {
+                set1.insert(filter::addr_to_u64(&addr));
+                set2.insert(filter::addr_to_u64_alt(&addr));
+                set3.insert(filter::addr_to_u64_alt2(&addr));
+            }
+        }
+        included_batches.push(bid);
+    }
+    anyhow::ensure!(!included_batches.is_empty(), "没有可用于生成 BF 的批次（当前批次可能仍在写入中）");
+
+    let keys1: Vec<u64> = set1.into_iter().collect();
+    let keys2: Vec<u64> = set2.into_iter().collect();
+    let keys3: Vec<u64> = set3.into_iter().collect();
+    let entries = keys1.len();
+    let min_b = *included_batches.iter().min().unwrap();
+    let max_b = *included_batches.iter().max().unwrap();
+    // 连续批次用 filter.min-max；不连续时加 nN 表示实际批次数，避免与「连续区间」混淆
+    let contiguous = included_batches.len() == (max_b - min_b + 1) as usize;
+    let base_name = if contiguous { format!("filter.{}-{}", min_b, max_b) } else { format!("filter.{}-{}-n{}", min_b, max_b, included_batches.len()) };
+    let out_path = out_dir.join(format!("{}.bin", base_name));
+    let out_alt = out_dir.join(format!("{}.alt.bin", base_name));
+    let out_alt2 = out_dir.join(format!("{}.alt2.bin", base_name));
+    let f1 = filter::build_fuse16(&keys1)?;
+    let f2 = filter::build_fuse16(&keys2)?;
+    let f3 = filter::build_fuse16(&keys3)?;
+    filter::save_fuse16(&f1, &out_path)?;
+    filter::save_fuse16(&f2, &out_alt)?;
+    filter::save_fuse16(&f3, &out_alt2)?;
+    fetcher::save_fetch_filter_meta(&out_path, &included_batches, max_b * fetcher::SEGMENT_SIZE)?;
+    println!("BuildFilter done: batches={:?} entries={} -> {}", included_batches, entries, out_path.display());
     Ok(())
 }
 
 fn cmd_filter_query(cfg: config::AppConfig, address: &str, filter_path: Option<&str>) -> Result<()> {
     let addr = fetcher::parse_hex_addr(address.trim()).ok_or_else(|| anyhow::anyhow!("无效地址: {}", address))?;
-    let fp = filter::addr_to_u64(&addr);
-    let paths: Vec<std::path::PathBuf> = match filter_path {
-        Some(s) => {
-            let p = std::path::PathBuf::from(s);
-            if p.is_dir() {
-                let mut v: Vec<_> = std::fs::read_dir(&p)?.filter_map(|e| e.ok()).filter(|e| e.path().extension().map_or(false, |x| x == "bin")).map(|e| e.path()).collect();
-                v.sort();
-                v
-            } else {
-                if !p.exists() { anyhow::bail!("过滤器文件不存在: {}", p.display()); }
-                vec![p]
-            }
-        }
+    let hit = match filter_path {
         None => {
             let dir = cfg.fetcher_dir();
             if !dir.exists() { anyhow::bail!("fetcher 目录不存在: {}", dir.display()); }
-            let mut v: Vec<_> = std::fs::read_dir(&dir)?.filter_map(|e| {
-                let e = e.ok()?;
-                let name = e.file_name();
-                let n = name.to_string_lossy();
-                if n.starts_with("filter.") && n.ends_with(".bin") { Some(e.path()) } else { None }
-            }).collect();
-            v.sort();
-            v
+            collider::bf_contains(&dir, &addr)?
+        }
+        Some(s) => {
+            let p = std::path::Path::new(s);
+            if !p.exists() { anyhow::bail!("路径不存在: {}", p.display()); }
+            if p.is_dir() { collider::bf_contains(p, &addr)? } else {
+                let f = filter::load_fuse16(p)?;
+                f.contains(&filter::addr_to_u64(&addr))
+            }
         }
     };
-    anyhow::ensure!(!paths.is_empty(), "未找到任何 filter.*.bin 文件");
-    let mut filters: Vec<filter::BinaryFuse16> = Vec::with_capacity(paths.len());
-    for p in &paths {
-        let f = filter::load_fuse16(p)?;
-        filters.push(f);
-        eprintln!("loaded: {}", p.display());
-    }
-    let hit = filters.iter().any(|f| f.contains(&fp));
     println!("{}", if hit { 1 } else { 0 });
     Ok(())
 }
 
-fn run_fetch_multi(batches: &[u64], latest: u64, total_batches: u64, out_root: &std::path::Path, rpc_urls: &[String], timeout_secs: u64, batch_size: usize, fetcher_dir: &std::path::Path) -> Result<()> {
+fn run_fetch_multi(batches: &[u64], latest: u64, total_batches: u64, out_root: &std::path::Path, rpc_urls: &[String], timeout_secs: u64, batch_size: usize) -> Result<()> {
     use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
     use std::collections::HashMap;
     use std::sync::mpsc;
@@ -241,12 +298,9 @@ fn run_fetch_multi(batches: &[u64], latest: u64, total_batches: u64, out_root: &
         let out = out_root.to_path_buf();
         let urls = rpc_urls.to_vec();
         let tx_send = progress_tx.clone();
-        let fdir = fetcher_dir.to_path_buf();
-        let tot = total_batches;
         handles.push(thread::spawn(move || {
             let prog = Some((b, tx_send));
-            let filter_dir = if b == tot { Some(fdir.as_path()) } else { None };
-            fetcher::run_fetch_range(&out, start_block, end_block, &urls, timeout_secs, batch_size, None, prog, filter_dir, false)
+            fetcher::run_fetch_range(&out, start_block, end_block, &urls, timeout_secs, batch_size, None, prog, false)
         }));
     }
     drop(progress_tx);
@@ -270,13 +324,6 @@ fn resolve_rpc_urls(cfg: &config::AppConfig, rpc_cli: Option<String>) -> Result<
         anyhow::bail!("no RPC URL. Use --rpc <URL> or set [fetcher].rpc_url / rpc_urls in config.toml");
     };
     Ok(urls)
-}
-
-fn cmd_gen_derivation_candidates(cfg: config::AppConfig, output: Option<&str>) -> Result<()> {
-    let out_path = output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.derivation_candidates_path());
-    let n = derivation::run_gen_derivation_candidates(&out_path)?;
-    println!("wrote {} candidates -> {}", n, out_path.display());
-    Ok(())
 }
 
 fn cmd_collide(cfg: config::AppConfig, threads: usize) -> Result<()> {

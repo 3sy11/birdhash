@@ -71,23 +71,48 @@ fn derive_eth_privkey_and_address(seed: &[u8; 64], account: u32, index: u32) -> 
     Ok((sk, addr))
 }
 
-// ── BF 加载 ──
+// ── BF 加载（支持三指纹：.bin + .alt.bin + .alt2.bin，无 alt/alt2 时退化为双指纹或单指纹） ──
 
-fn load_all_bf(fetcher_dir: &Path) -> Result<Vec<BinaryFuse16>> {
+struct BfTriple(pub BinaryFuse16, pub Option<BinaryFuse16>, pub Option<BinaryFuse16>);
+
+fn load_all_bf(fetcher_dir: &Path) -> Result<Vec<BfTriple>> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(fetcher_dir).with_context(|| format!("read_dir {}", fetcher_dir.display()))?
-        .filter_map(|e| { let p = e.ok()?.path(); let n = p.file_name()?.to_string_lossy().to_string(); if n.starts_with("filter.") && n.ends_with(".bin") { Some(p) } else { None } })
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            let n = p.file_name()?.to_string_lossy().to_string();
+            if n.starts_with("filter.") && n.ends_with(".bin") && !n.contains(".alt") && n.contains('-') { Some(p) } else { None }
+        })
         .collect();
     paths.sort();
-    let mut filters = Vec::with_capacity(paths.len());
+    let mut triples = Vec::with_capacity(paths.len());
     for p in &paths {
-        filters.push(filter::load_fuse16(p).with_context(|| format!("load {}", p.display()))?);
+        let f1 = filter::load_fuse16(p).with_context(|| format!("load {}", p.display()))?;
+        let parent = p.parent().unwrap_or_else(|| Path::new("."));
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let alt_path = parent.join(format!("{}.alt.bin", stem));
+        let alt2_path = parent.join(format!("{}.alt2.bin", stem));
+        let f2 = if alt_path.exists() { Some(filter::load_fuse16(&alt_path).with_context(|| format!("load alt {}", alt_path.display()))?) } else { None };
+        let f3 = if alt2_path.exists() { Some(filter::load_fuse16(&alt2_path).with_context(|| format!("load alt2 {}", alt2_path.display()))?) } else { None };
+        triples.push(BfTriple(f1, f2, f3));
     }
-    Ok(filters)
+    Ok(triples)
 }
 
-fn contains_bf(filters: &[BinaryFuse16], addr: &[u8; ADDR_LEN]) -> bool {
-    let fp = filter::addr_to_u64(addr);
-    filters.iter().any(|f| f.contains(&fp))
+fn contains_bf(triples: &[BfTriple], addr: &[u8; ADDR_LEN]) -> bool {
+    let fp1 = filter::addr_to_u64(addr);
+    let fp2 = filter::addr_to_u64_alt(addr);
+    let fp3 = filter::addr_to_u64_alt2(addr);
+    triples.iter().any(|BfTriple(f1, alt, alt2)| {
+        if let (Some(f2), Some(f3)) = (alt, alt2) { f1.contains(&fp1) && f2.contains(&fp2) && f3.contains(&fp3) }
+        else if let Some(f2) = alt { f1.contains(&fp1) && f2.contains(&fp2) }
+        else { f1.contains(&fp1) }
+    })
+}
+
+/// 供 CLI filter-query 与碰撞器：从 fetcher_dir 加载所有 BF（含 .alt/.alt2 三指纹），判断地址是否命中
+pub fn bf_contains(fetcher_dir: &Path, addr: &[u8; ADDR_LEN]) -> Result<bool> {
+    let triples = load_all_bf(fetcher_dir)?;
+    Ok(!triples.is_empty() && contains_bf(&triples, addr))
 }
 
 // ── 派生候选 ──
