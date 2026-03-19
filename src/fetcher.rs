@@ -1,8 +1,8 @@
-//! Fetcher: 仅拉取原始块数据。按区间 [start_block, end_block] 写入 {start}-{end}/blocks.jsonl + checkpoint.json。
-//! 供下游（碰撞器）读取 blocks.jsonl 解析地址。AddressStore/load_new_addrs 保留供 Collider/Scanner 消费已有数据。
+//! Fetcher: 拉取原始块数据，提取链上地址，构建 BF 过滤器供碰撞器使用。
 
 use crate::filter;
-use crate::keygen::{Address, ADDR_LEN};
+const ADDR_LEN: usize = 20;
+type Address = [u8; ADDR_LEN];
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::cell::RefCell;
@@ -16,86 +16,6 @@ const CHECKPOINT_SAVE_INTERVAL: u64 = 50;
 thread_local!(static FETCH_OUTPUT_PREFIX: RefCell<String> = RefCell::new(String::new()));
 pub fn set_fetch_output_prefix(s: &str) { FETCH_OUTPUT_PREFIX.with(|c| *c.borrow_mut() = s.to_string()); }
 fn fetch_prefix() -> String { FETCH_OUTPUT_PREFIX.with(|c| c.borrow().clone()) }
-
-// ── AddressStore: append-only flat [u8;20] file ──
-
-pub struct AddressStore {
-    path: std::path::PathBuf,
-    count: u64,
-}
-
-impl AddressStore {
-    pub fn open(path: &std::path::Path) -> Result<Self> {
-        let count = if path.exists() {
-            let len = std::fs::metadata(path)?.len();
-            anyhow::ensure!(len % ADDR_LEN as u64 == 0, "all_addrs.bin corrupt: size {} not multiple of {}", len, ADDR_LEN);
-            len / ADDR_LEN as u64
-        } else { 0 };
-        Ok(Self { path: path.to_path_buf(), count })
-    }
-    pub fn count(&self) -> u64 { self.count }
-
-    pub fn append(&mut self, addrs: &[Address]) -> Result<()> {
-        if addrs.is_empty() { return Ok(()); }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
-        for a in addrs { f.write_all(a)?; }
-        self.count += addrs.len() as u64;
-        Ok(())
-    }
-
-    pub fn read_all_addresses(&self) -> Result<Vec<Address>> {
-        if self.count == 0 { return Ok(vec![]); }
-        let data = std::fs::read(&self.path)?;
-        let mut addrs = Vec::with_capacity(self.count as usize);
-        for chunk in data.chunks_exact(ADDR_LEN) {
-            let mut addr = [0u8; ADDR_LEN];
-            addr.copy_from_slice(chunk);
-            addrs.push(addr);
-        }
-        Ok(addrs)
-    }
-
-    pub fn read_all_fingerprints(&self) -> Result<Vec<u64>> {
-        if self.count == 0 { return Ok(vec![]); }
-        let data = std::fs::read(&self.path)?;
-        let mut fps = Vec::with_capacity(self.count as usize);
-        for chunk in data.chunks_exact(ADDR_LEN) {
-            let mut addr = [0u8; ADDR_LEN];
-            addr.copy_from_slice(chunk);
-            fps.push(filter::addr_to_u64(&addr));
-        }
-        Ok(fps)
-    }
-}
-
-// ── Export/Import new_addrs.bin ──
-
-pub fn save_new_addrs(addrs: &[Address], path: &std::path::Path) -> Result<()> {
-    if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-    let mut buf = Vec::with_capacity(8 + addrs.len() * ADDR_LEN);
-    buf.extend_from_slice(&(addrs.len() as u64).to_le_bytes());
-    for a in addrs { buf.extend_from_slice(a); }
-    let tmp = path.with_extension("bin.tmp");
-    std::fs::write(&tmp, &buf)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-pub fn load_new_addrs(path: &std::path::Path) -> Result<Vec<Address>> {
-    if !path.exists() { return Ok(vec![]); }
-    let data = std::fs::read(path)?;
-    anyhow::ensure!(data.len() >= 8, "new_addrs.bin too short");
-    let count = u64::from_le_bytes(data[0..8].try_into()?) as usize;
-    anyhow::ensure!(data.len() == 8 + count * ADDR_LEN, "new_addrs.bin size mismatch");
-    let mut addrs = Vec::with_capacity(count);
-    for i in 0..count {
-        let off = 8 + i * ADDR_LEN;
-        let mut a = [0u8; ADDR_LEN];
-        a.copy_from_slice(&data[off..off + ADDR_LEN]);
-        addrs.push(a);
-    }
-    Ok(addrs)
-}
 
 // ── Ethereum JSON-RPC client with retry ──
 
@@ -187,8 +107,6 @@ impl RpcPool {
     pub fn new(urls: Vec<String>, timeout_secs: u64) -> Self {
         Self { urls, current: 0, timeout_secs }
     }
-    pub fn url_count(&self) -> usize { self.urls.len() }
-
     fn with_rpc<F, T>(&mut self, f: F) -> Result<T>
     where
         F: Fn(&EthRpc) -> Result<T>,
@@ -810,55 +728,9 @@ pub fn merge_and_archive_latest(range_root: &Path, seg_start: u64, filter_out_di
     Ok(())
 }
 
-/// 读取过滤器元信息，文件不存在则返回 None
-pub fn load_fetch_filter_meta(filter_path: &Path) -> Result<Option<FetchFilterMeta>> {
-    let path = fetch_filter_meta_path(filter_path);
-    if !path.exists() { return Ok(None); }
-    let s = std::fs::read_to_string(&path)?;
-    Ok(Some(serde_json::from_str(&s)?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xorf::Filter;
-
-    fn test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("birdhash_fetch_{}_{}", name, std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn address_store_append_and_read() {
-        let dir = test_dir("store");
-        let path = dir.join("all_addrs.bin");
-        let mut store = AddressStore::open(&path).unwrap();
-        assert_eq!(store.count(), 0);
-        let a1: Address = [1u8; 20];
-        let a2: Address = [2u8; 20];
-        store.append(&[a1, a2]).unwrap();
-        assert_eq!(store.count(), 2);
-        let fps = store.read_all_fingerprints().unwrap();
-        assert_eq!(fps.len(), 2);
-        assert_eq!(fps[0], filter::addr_to_u64(&a1));
-        assert_eq!(fps[1], filter::addr_to_u64(&a2));
-        let store2 = AddressStore::open(&path).unwrap();
-        assert_eq!(store2.count(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn new_addrs_round_trip() {
-        let dir = test_dir("newaddrs");
-        let path = dir.join("new_addrs.bin");
-        let addrs: Vec<Address> = (0..100u8).map(|i| { let mut a = [0u8; 20]; a[0] = i; a }).collect();
-        save_new_addrs(&addrs, &path).unwrap();
-        let loaded = load_new_addrs(&path).unwrap();
-        assert_eq!(addrs, loaded);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn parse_hex_addr_valid() {
@@ -896,26 +768,6 @@ mod tests {
         let from2: Address = parse_hex_addr("0x6813Eb9362372EEF6200f3b1dbC3f819671cBA69").unwrap();
         assert!(addrs.contains(&from2));
         assert!(addrs.contains(&create_address(&from2, 0)));
-    }
-
-    #[test]
-    fn filter_rebuild_from_store() {
-        let dir = test_dir("rebuild");
-        let path = dir.join("all_addrs.bin");
-        let filter_path = dir.join("filter_fetch.bin");
-        let mut store = AddressStore::open(&path).unwrap();
-        let addrs: Vec<Address> = (0u16..1000).flat_map(|i| {
-            (0u8..5).map(move |j| { let mut a = [0u8; 20]; a[0] = (i & 0xFF) as u8; a[1] = (i >> 8) as u8; a[2] = j; a })
-        }).collect();
-        store.append(&addrs).unwrap();
-        let mut fps = store.read_all_fingerprints().unwrap();
-        fps.sort_unstable();
-        fps.dedup();
-        let f = filter::build_fuse16(&fps).unwrap();
-        filter::save_fuse16(&f, &filter_path).unwrap();
-        let f2 = filter::load_fuse16(&filter_path).unwrap();
-        for a in &addrs { assert!(f2.contains(&filter::addr_to_u64(a))); }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

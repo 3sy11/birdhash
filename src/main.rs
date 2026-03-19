@@ -1,9 +1,9 @@
+mod collider;
 mod config;
 mod derivation;
 mod fetcher;
 mod filter;
-#[allow(dead_code)]
-mod keygen;
+mod generator;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::Write;
@@ -24,46 +24,55 @@ enum Commands {
     Init,
     /// Fetch raw blocks by batch: 1=1..100000, 2=100001..200000, ... Omit = latest batch (with poll loop if poll_interval_secs>0).
     Fetch {
-        /// Batch index (1-based). Multiple: --batch 1 2 3 4 or --batch 1,2,3,4. Single/omit = latest batch.
         #[arg(long, num_args(1..), value_delimiter(','))]
         batch: Option<Vec<u64>>,
-        /// RPC URL (required or set [fetcher].rpc_url in config). Also accepted as --rpc-url.
         #[arg(short, long, alias = "rpc-url")]
         rpc: Option<String>,
-        /// Output root dir (default: data/fetcher/ranges)
         #[arg(long)]
         output_dir: Option<String>,
     },
-    /// 从已拉取的块数据构建地址过滤器（BinaryFuse16）。无参则扫描全量批次逐批构建；--batch 可多批合并为一个 filter。输出 filter.{id}-{id}.bin + 元信息。
+    /// 从已拉取的块数据构建地址过滤器（BinaryFuse16）
     BuildFilter {
-        /// 批 ID，与 Fetch 一致。可多个合并：--batch 1 2 3 4。不传则构建数据目录下全部批次（各一个 filter）
         #[arg(long, num_args(0..), value_delimiter(','))]
         batch: Option<Vec<u64>>,
-        /// 过滤器输出目录（默认: data/fetcher）
+        #[arg(long)]
+        source: Option<String>,
         #[arg(long)]
         output: Option<String>,
     },
-    /// 查询地址是否在获取器过滤器中：输入地址，输出 0=不存在 1=存在
+    /// 查询地址是否在 BF 过滤器中
     FilterQuery {
-        /// 以太坊地址（0x 开头或 40 位十六进制）
         #[arg(required = true)]
         address: String,
-        /// 过滤器文件路径（默认: data/fetcher/filter_fetch.bin）
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Fetch one block and print block info, transactions, extracted addresses
+    /// Fetch one block and print block info
     FetchTest {
         #[arg(short, long)]
         rpc: Option<String>,
         #[arg(short, long)]
         block: Option<u64>,
     },
-    /// 生成派生路径 index 候选并写入 assets/derivation_candidates/（account 取 0-111，index 取该文件所列值）
+    /// 生成派生路径候选
     GenDerivationCandidates {
-        /// 输出文件路径（默认: assets/derivation_candidates/derivation_candidates.txt）
         #[arg(long)]
         output: Option<String>,
+    },
+    /// 碰撞器：N 线程生成地址，实时与 BF 碰撞，命中写 CSV，支持断点续碰
+    Collide {
+        /// worker 线程数（默认 4）
+        #[arg(long, default_value = "4")]
+        threads: usize,
+    },
+    /// 查询 ID 的助记词/地址/私钥信息，或导出全部派生 CSV
+    IdInfo {
+        /// ID 序号
+        #[arg(required = true)]
+        id: u64,
+        /// 导出全部 (account×index) 派生为 CSV
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -74,10 +83,12 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(cfg),
         Commands::Fetch { batch, rpc, output_dir } => cmd_fetch(cfg, batch.as_deref(), rpc, output_dir, &cli.config),
-        Commands::BuildFilter { batch, output } => cmd_build_filter(cfg, batch.as_deref(), output.as_deref()),
+        Commands::BuildFilter { batch, source, output } => cmd_build_filter(cfg, batch.as_deref(), source.as_deref(), output.as_deref()),
         Commands::FilterQuery { address, filter } => cmd_filter_query(cfg, &address, filter.as_deref()),
         Commands::FetchTest { rpc, block } => cmd_fetch_test(cfg, rpc, block),
         Commands::GenDerivationCandidates { output } => cmd_gen_derivation_candidates(cfg, output.as_deref()),
+        Commands::Collide { threads } => cmd_collide(cfg, threads),
+        Commands::IdInfo { id, all } => cmd_id_info(cfg, id, all),
     }
 }
 
@@ -87,7 +98,8 @@ fn load_config(cli: &Cli) -> config::AppConfig {
 
 fn cmd_init(cfg: config::AppConfig) -> Result<()> {
     cfg.ensure_dirs()?;
-    println!("birdhash init: data_dir={}", cfg.data_dir.display());
+    collider::write_new_seed(&cfg.generator_seed_path())?;
+    println!("birdhash init: data_dir={} | 已重新生成 {}", cfg.data_dir.display(), cfg.generator_seed_path().display());
     Ok(())
 }
 
@@ -134,8 +146,8 @@ fn cmd_fetch(cfg: config::AppConfig, batches: Option<&[u64]>, rpc_cli: Option<St
     Ok(())
 }
 
-fn cmd_build_filter(cfg: config::AppConfig, batch: Option<&[u64]>, output: Option<&str>) -> Result<()> {
-    let range_root = cfg.fetcher_ranges_dir();
+fn cmd_build_filter(cfg: config::AppConfig, batch: Option<&[u64]>, source: Option<&str>, output: Option<&str>) -> Result<()> {
+    let range_root = source.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_ranges_dir());
     let out_dir = output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_dir());
     let (count, entries) = match batch {
         Some(ids) if !ids.is_empty() => {
@@ -265,6 +277,19 @@ fn cmd_gen_derivation_candidates(cfg: config::AppConfig, output: Option<&str>) -
     let n = derivation::run_gen_derivation_candidates(&out_path)?;
     println!("wrote {} candidates -> {}", n, out_path.display());
     Ok(())
+}
+
+fn cmd_collide(cfg: config::AppConfig, threads: usize) -> Result<()> {
+    collider::run_collider(&cfg, threads)
+}
+
+fn cmd_id_info(cfg: config::AppConfig, id: u64, all: bool) -> Result<()> {
+    if all {
+        let out = cfg.generator_dir().join(format!("export_id_{}_all.csv", id));
+        generator::export_id_all_derivations_to_csv(&cfg, id, &out)
+    } else {
+        generator::print_id_details(&cfg, id)
+    }
 }
 
 fn cmd_fetch_test(cfg: config::AppConfig, rpc_cli: Option<String>, block_arg: Option<u64>) -> Result<()> {
