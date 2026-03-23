@@ -124,8 +124,12 @@ fn cmd_fetch(cfg: config::AppConfig, batches: Option<&[u64]>, rpc_cli: Option<St
     let batch = batches[0];
     let prefix = std::env::var("BIRDHASH_BATCH").ok().map(|b| format!("[batch={}] ", b)).unwrap_or_default();
     println!("{}latest={} total_batches={} batch={}", prefix, latest, total_batches, batch);
-    let start_block = (batch - 1) * SEGMENT_SIZE + 1;
+    let theoretical_start = (batch - 1) * SEGMENT_SIZE + 1;
     let mut end_block = (batch * SEGMENT_SIZE).min(latest);
+    let disk_through = fetcher::max_fetched_block_on_disk(&out_root)?;
+    let resume_next = disk_through.saturating_add(1);
+    // 有落盘数据时从下一块续传（与 meta 一致）；无数据时从本批理论起点开始，避免被「248 批起点」跳过未写完的 247
+    let start_block = if disk_through == 0 { theoretical_start } else { resume_next };
     fetcher::run_fetch_range(&out_root, start_block, end_block, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None, false)?;
     if batch == total_batches && cfg.poll_interval_secs > 0 {
         loop {

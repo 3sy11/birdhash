@@ -315,6 +315,45 @@ fn segment_last_fetched(root: &Path, seg_s: u64) -> u64 {
     seg_s.saturating_sub(1)
 }
 
+/// 块号所属的批次号（与 main 中 batch 定义一致：batch 1 = 块 1..=100000）
+pub fn batch_id_for_block(block: u64) -> u64 {
+    if block == 0 { return 0; }
+    (block - 1) / SEGMENT_SIZE + 1
+}
+
+/// 扫描 ranges 下各 10 万区间目录，取已写入的最大块号；空目录不计（segment_last_fetched 空时 last&lt;seg_s）
+pub fn max_fetched_block_on_disk(range_root: &Path) -> Result<u64> {
+    let mut max_b = 0u64;
+    let entries = std::fs::read_dir(range_root).with_context(|| format!("read_dir {}", range_root.display()))?;
+    for e in entries {
+        let e = e?;
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Some((a, _)) = name.split_once('-') {
+            if let Ok(seg_s) = a.parse::<u64>() {
+                if seg_s % SEGMENT_SIZE != 0 { continue; }
+                let last = segment_last_fetched(range_root, seg_s);
+                if last >= seg_s { max_b = max_b.max(last); }
+            }
+        }
+    }
+    Ok(max_b)
+}
+
+/// 在 [span_lo, span_hi] 所覆盖的 10 万段内，取已落盘的最大块号（用于本段续传，避免与并行其它批次串台）
+fn max_fetched_in_span(range_root: &Path, span_lo: u64, span_hi: u64) -> Option<u64> {
+    if span_lo > span_hi { return None; }
+    let mut max_b: Option<u64> = None;
+    let mut seg = seg_start(span_lo);
+    let end_seg = seg_start(span_hi);
+    loop {
+        let last = segment_last_fetched(range_root, seg);
+        if last >= seg { max_b = Some(max_b.map_or(last, |m| m.max(last))); }
+        if seg >= end_seg { break; }
+        seg = seg.saturating_add(SEGMENT_SIZE);
+    }
+    max_b
+}
+
 fn save_checkpoint_static(path: &Path, cp: &FetchRangeCheckpoint) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(cp).unwrap())?;
@@ -360,12 +399,22 @@ pub fn run_fetch_range(
     anyhow::ensure!(start_block <= end_block, "start_block > end_block");
     std::fs::create_dir_all(output_root)?;
     let mut meta = ensure_meta_upgraded(output_root)?;
+    let disk_through = max_fetched_block_on_disk(output_root)?;
+    // 续传以 ranges 目录为准；meta 仅作对齐（避免此前只在 seg_head 写 meta 导致批次号虚高）
+    meta.current_batch_fetched_through_block = disk_through;
+    meta.current_batch = batch_id_for_block(disk_through);
+    meta.version = META_VERSION;
+    save_meta(output_root, &meta)?;
     let mut pool = RpcPool::new(rpc_urls.to_vec(), timeout_secs);
     let latest = pool.get_latest_block_number()?;
     let end_block = end_block.min(latest);
-    let batch_id = end_block / SEGMENT_SIZE + 1;
-    if !use_progress && !poll_mode { print!("{}", p); println!("Fetch meta current_batch={} through={} (latest={})", meta.current_batch, meta.current_batch_fetched_through_block, latest); }
-    let mut next = (meta.current_batch_fetched_through_block.saturating_add(1)).max(start_block);
+    let batch_id = batch_id_for_block(end_block);
+    if !use_progress && !poll_mode { print!("{}", p); println!("Fetch disk_through={} meta aligned | current_batch={} through={} (latest={})", disk_through, meta.current_batch, meta.current_batch_fetched_through_block, latest); }
+    // 续传只看 [start_block,end_block] 覆盖段内的落盘进度（main 有数据时传 resume_next 作 start_block，避免被「本批理论起点」抬高）
+    let mut next = match max_fetched_in_span(output_root, start_block, end_block) {
+        None => start_block,
+        Some(h) => h.saturating_add(1),
+    };
     if next > end_block {
         if !use_progress && !poll_mode { print!("{}", p); println!("Already have through {}, skip fetch.", meta.current_batch_fetched_through_block); }
         if poll_mode { print!("\r  batch={} height={}   ", batch_id, end_block); let _ = std::io::stdout().flush(); }
@@ -376,39 +425,12 @@ pub fn run_fetch_range(
     let mut total_written: u64 = already_have;
     let batch_size = batch_size.max(1);
     type SegKey = u64;
-    let seg_head = seg_start(end_block);
     let mut segments: std::collections::HashMap<SegKey, (std::fs::File, FetchRangeCheckpoint, std::path::PathBuf)> = std::collections::HashMap::new();
-    let open_seg = |seg_s: u64, root: &Path, end_blk: u64| -> Result<(std::fs::File, FetchRangeCheckpoint, std::path::PathBuf)> {
-        if seg_s == seg_start(end_blk) {
-            let (range_dir, cp, checkpoint_path) = ensure_range_ready_for_segment(root, seg_s)?;
-            let chunk0 = range_dir.join("chunk_000.jsonl");
-            let f = std::fs::OpenOptions::new().create(true).append(true).open(&chunk0)?;
-            return Ok((f, cp, checkpoint_path));
-        }
-        let name = seg_dir_name(seg_s);
-        let range_dir = root.join(&name);
-        std::fs::create_dir_all(&range_dir)?;
-        let blocks_path = range_dir.join("blocks.jsonl");
-        let checkpoint_path = range_dir.join("checkpoint.json");
-        let mut cp = FetchRangeCheckpoint {
-            start_block: seg_s,
-            end_block: seg_s + SEGMENT_SIZE - 1,
-            last_fetched_block: seg_s.saturating_sub(1),
-            status: "running".into(),
-            updated_at: Utc::now(),
-        };
-        if checkpoint_path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&checkpoint_path) {
-                if let Ok(loaded) = serde_json::from_str::<FetchRangeCheckpoint>(&data) {
-                    if loaded.start_block == seg_s { cp.last_fetched_block = loaded.last_fetched_block; }
-                }
-            }
-        }
-        if cp.last_fetched_block < seg_s && blocks_path.exists() {
-            let line_count = std::io::BufReader::new(std::fs::File::open(&blocks_path)?).lines().count();
-            if line_count > 0 { cp.last_fetched_block = seg_s.saturating_add(line_count as u64).saturating_sub(1); }
-        }
-        let f = std::fs::OpenOptions::new().create(true).append(true).open(&blocks_path)?;
+    // 任意 10 万块区间均与拉最新批一致：chunk_000..chunk_099（每 chunk 1000 块），不写单文件 blocks.jsonl
+    let open_seg = |seg_s: u64, root: &Path| -> Result<(std::fs::File, FetchRangeCheckpoint, std::path::PathBuf)> {
+        let (range_dir, cp, checkpoint_path) = ensure_range_ready_for_segment(root, seg_s)?;
+        let chunk0 = range_dir.join("chunk_000.jsonl");
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(&chunk0)?;
         Ok((f, cp, checkpoint_path))
     };
     let start_time = std::time::Instant::now();
@@ -420,30 +442,28 @@ pub fn run_fetch_range(
         for (_bn, block_json) in &blocks {
             let bn = block_json["number"].as_str().and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
             let seg = seg_start(bn);
-            let (file, cp, ck_path) = segments.entry(seg).or_insert_with(|| open_seg(seg, output_root, end_block).expect("open_seg"));
+            let (file, cp, ck_path) = segments.entry(seg).or_insert_with(|| open_seg(seg, output_root).expect("open_seg"));
             if bn <= cp.last_fetched_block { continue; }
             let line = serde_json::to_string(block_json).context("block to json")?;
-            if seg == seg_head {
-                let latest_dir = ck_path.parent().unwrap();
-                let chunk_idx = ((bn - cp.start_block) / CHUNK_SIZE) as u32;
-                if chunk_idx == 0 { writeln!(file, "{}", line)?; } else {
-                    let chunk_path = latest_dir.join(format!("chunk_{:03}.jsonl", chunk_idx));
-                    let mut cf = std::fs::OpenOptions::new().create(true).append(true).open(&chunk_path)?;
-                    writeln!(cf, "{}", line)?;
-                }
-            } else { writeln!(file, "{}", line)?; }
+            let range_dir = ck_path.parent().unwrap();
+            let chunk_idx = ((bn - cp.start_block) / CHUNK_SIZE) as u32;
+            if chunk_idx == 0 { writeln!(file, "{}", line)?; } else {
+                let chunk_path = range_dir.join(format!("chunk_{:03}.jsonl", chunk_idx));
+                let mut cf = std::fs::OpenOptions::new().create(true).append(true).open(&chunk_path)?;
+                writeln!(cf, "{}", line)?;
+            }
             cp.last_fetched_block = bn;
             cp.updated_at = Utc::now();
             total_written += 1;
             current_block = bn;
-            if seg == seg_head {
-                meta.current_batch = batch_id;
-                meta.current_batch_fetched_through_block = bn;
+            // 任意区间写入都更新 meta（同一批跨多个 10 万目录时不再只依赖 seg_head）
+            meta.current_batch_fetched_through_block = bn;
+            meta.current_batch = batch_id_for_block(bn);
+            if total_written % CHECKPOINT_SAVE_INTERVAL == 0 {
                 save_meta(output_root, &meta)?;
                 save_checkpoint_static(ck_path, cp)?;
             }
-            if seg != seg_head && total_written % CHECKPOINT_SAVE_INTERVAL == 0 { save_checkpoint_static(ck_path, cp)?; file.flush()?; }
-            else if seg == seg_head { file.flush()?; }
+            if chunk_idx == 0 { file.flush()?; }
         }
         if blocks.is_empty() { break; }
         next = blocks.last().map(|(b, _)| *b).unwrap_or(next).saturating_add(1);
@@ -460,6 +480,7 @@ pub fn run_fetch_range(
         file.flush()?;
         save_checkpoint_static(ck_path, cp)?;
     }
+    let _ = save_meta(output_root, &meta);
     if poll_mode { print!("\r  batch={} height={} blocks={}   ", batch_id, end_block, total_written); let _ = std::io::stdout().flush(); }
     else if !use_progress { print!("{}", p); println!("\nDone. {} blocks written, {} segments in {:.1}s", total_written, segments.len(), start_time.elapsed().as_secs_f64()); }
     set_fetch_output_prefix("");
