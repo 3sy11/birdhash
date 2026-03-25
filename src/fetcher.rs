@@ -257,10 +257,18 @@ pub fn load_meta(range_root: &Path) -> Result<FetchMeta> {
 fn save_meta(range_root: &Path, meta: &FetchMeta) -> Result<()> {
     let p = meta_path(range_root);
     if let Some(parent) = p.parent() { std::fs::create_dir_all(parent)?; }
-    let tmp = p.with_extension("json.tmp");
+    let tmp = unique_tmp_path(&p);
     std::fs::write(&tmp, serde_json::to_string_pretty(meta)?)?;
     std::fs::rename(&tmp, &p)?;
     Ok(())
+}
+
+fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
+    let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')', ' '], "");
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    dir.join(format!(".{}.{}.{}.tmp", name, tid, ts))
 }
 
 /// 若 meta 不存在或 version<1 则从 ranges 目录推断当前批次并写 meta
@@ -355,7 +363,7 @@ fn max_fetched_in_span(range_root: &Path, span_lo: u64, span_hi: u64) -> Option<
 }
 
 fn save_checkpoint_static(path: &Path, cp: &FetchRangeCheckpoint) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
+    let tmp = unique_tmp_path(path);
     std::fs::write(&tmp, serde_json::to_string_pretty(cp).unwrap())?;
     std::fs::rename(&tmp, path)?;
     Ok(())
