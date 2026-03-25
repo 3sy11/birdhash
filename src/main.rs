@@ -128,8 +128,8 @@ fn cmd_fetch(cfg: config::AppConfig, batches: Option<&[u64]>, rpc_cli: Option<St
     let mut end_block = (batch * SEGMENT_SIZE).min(latest);
     let disk_through = fetcher::max_fetched_block_on_disk(&out_root)?;
     let resume_next = disk_through.saturating_add(1);
-    // 有落盘数据时从下一块续传（与 meta 一致）；无数据时从本批理论起点开始，避免被「248 批起点」跳过未写完的 247
-    let start_block = if disk_through == 0 { theoretical_start } else { resume_next };
+    // 仅拉链顶批次时用全目录续传起点（可补齐上一批未写完）；历史批次只用本批理论起点，续传由 run_fetch_range 内 max_fetched_in_span 处理，否则全局 resume 会大于本批 end_block
+    let start_block = if batch == total_batches { if disk_through == 0 { theoretical_start } else { resume_next } } else { theoretical_start };
     fetcher::run_fetch_range(&out_root, start_block, end_block, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, Some(&prefix), None, false)?;
     if batch == total_batches && cfg.poll_interval_secs > 0 {
         loop {

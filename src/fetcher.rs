@@ -323,6 +323,42 @@ fn segment_last_fetched(root: &Path, seg_s: u64) -> u64 {
     seg_s.saturating_sub(1)
 }
 
+fn block_number_from_json_line(line: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let bn_hex = v["number"].as_str()?;
+    u64::from_str_radix(bn_hex.trim_start_matches("0x"), 16).ok()
+}
+
+/// 仅统计 [span_lo, span_hi] 内实际出现的块号（并行多批共享同一 seg 目录时，行数推算会误判）
+fn max_block_in_segment_span_parsed(range_root: &Path, seg_s: u64, span_lo: u64, span_hi: u64) -> Option<u64> {
+    if span_lo > span_hi { return None; }
+    let range_dir = range_root.join(seg_dir_name(seg_s));
+    if !range_dir.is_dir() { return None; }
+    let mut max_b: Option<u64> = None;
+    let blocks_path = range_dir.join("blocks.jsonl");
+    if blocks_path.exists() {
+        if let Ok(f) = std::fs::File::open(&blocks_path) {
+            for line in std::io::BufReader::new(f).lines().flatten() {
+                if let Some(bn) = block_number_from_json_line(&line) {
+                    if bn >= span_lo && bn <= span_hi { max_b = Some(max_b.map_or(bn, |m| m.max(bn))); }
+                }
+            }
+        }
+    }
+    for i in 0..CHUNK_COUNT {
+        let p = range_dir.join(format!("chunk_{:03}.jsonl", i));
+        if !p.exists() { continue; }
+        if let Ok(f) = std::fs::File::open(&p) {
+            for line in std::io::BufReader::new(f).lines().flatten() {
+                if let Some(bn) = block_number_from_json_line(&line) {
+                    if bn >= span_lo && bn <= span_hi { max_b = Some(max_b.map_or(bn, |m| m.max(bn))); }
+                }
+            }
+        }
+    }
+    max_b
+}
+
 /// 块号所属的批次号（与 main 中 batch 定义一致：batch 1 = 块 1..=100000）
 pub fn batch_id_for_block(block: u64) -> u64 {
     if block == 0 { return 0; }
@@ -347,15 +383,20 @@ pub fn max_fetched_block_on_disk(range_root: &Path) -> Result<u64> {
     Ok(max_b)
 }
 
-/// 在 [span_lo, span_hi] 所覆盖的 10 万段内，取已落盘的最大块号（用于本段续传，避免与并行其它批次串台）
+/// 在 [span_lo, span_hi] 内取已落盘的最大块号（按 JSON number 统计，与并行多批共享 seg 一致）
 fn max_fetched_in_span(range_root: &Path, span_lo: u64, span_hi: u64) -> Option<u64> {
     if span_lo > span_hi { return None; }
     let mut max_b: Option<u64> = None;
     let mut seg = seg_start(span_lo);
     let end_seg = seg_start(span_hi);
     loop {
-        let last = segment_last_fetched(range_root, seg);
-        if last >= seg { max_b = Some(max_b.map_or(last, |m| m.max(last))); }
+        let s_lo = span_lo.max(seg);
+        let s_hi = span_hi.min(seg + SEGMENT_SIZE - 1);
+        if s_lo <= s_hi {
+            if let Some(m) = max_block_in_segment_span_parsed(range_root, seg, s_lo, s_hi) {
+                max_b = Some(max_b.map_or(m, |x| x.max(m)));
+            }
+        }
         if seg >= end_seg { break; }
         seg = seg.saturating_add(SEGMENT_SIZE);
     }
@@ -373,11 +414,10 @@ fn ensure_range_ready_for_segment(root: &Path, seg_s: u64) -> Result<(std::path:
     let name = seg_dir_name(seg_s);
     let range_dir = root.join(&name);
     std::fs::create_dir_all(&range_dir)?;
-    let last = segment_last_fetched(root, seg_s);
     let cp = FetchRangeCheckpoint {
         start_block: seg_s,
         end_block: seg_s + SEGMENT_SIZE - 1,
-        last_fetched_block: last,
+        last_fetched_block: seg_s.saturating_sub(1),
         status: "running".into(),
         updated_at: Utc::now(),
     };
@@ -436,7 +476,10 @@ pub fn run_fetch_range(
     let mut segments: std::collections::HashMap<SegKey, (std::fs::File, FetchRangeCheckpoint, std::path::PathBuf)> = std::collections::HashMap::new();
     // 任意 10 万块区间均与拉最新批一致：chunk_000..chunk_099（每 chunk 1000 块），不写单文件 blocks.jsonl
     let open_seg = |seg_s: u64, root: &Path| -> Result<(std::fs::File, FetchRangeCheckpoint, std::path::PathBuf)> {
-        let (range_dir, cp, checkpoint_path) = ensure_range_ready_for_segment(root, seg_s)?;
+        let (range_dir, mut cp, checkpoint_path) = ensure_range_ready_for_segment(root, seg_s)?;
+        let span_lo = start_block.max(seg_s);
+        let span_hi = end_block.min(seg_s + SEGMENT_SIZE - 1);
+        cp.last_fetched_block = max_block_in_segment_span_parsed(root, seg_s, span_lo, span_hi).unwrap_or(seg_s.saturating_sub(1));
         let chunk0 = range_dir.join("chunk_000.jsonl");
         let f = std::fs::OpenOptions::new().create(true).append(true).open(&chunk0)?;
         Ok((f, cp, checkpoint_path))

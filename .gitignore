@@ -1,4 +1,5 @@
 /data
 /target
+/tools/target
 .DS_Store
 /tmp

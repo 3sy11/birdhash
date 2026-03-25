@@ -5,6 +5,10 @@ edition = "2021"
 description = "Ethereum address collision detector with 3-tier storage (L1 BinaryFuse8 / L2 Bloom / L3 distributed scan)"
 license = "MIT"
 
+[workspace]
+members = [".", "tools"]
+resolver = "2"
+
 [dependencies]
 secp256k1 = { version = "0.29", features = ["rand-std"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
