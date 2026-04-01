@@ -53,15 +53,28 @@ fn id_to_mnemonic_and_seed(seed_key: &[u8], id: u64) -> Result<(String, [u8; 64]
     Ok((phrase, out))
 }
 
-fn derive_eth_privkey_and_address(seed: &[u8; 64], account: u32, index: u32) -> Result<([u8; 32], [u8; ADDR_LEN])> {
+fn derive_eth_privkey_and_address(
+    seed: &[u8; 64],
+    account: u32,
+    index: u32,
+) -> Result<([u8; 32], [u8; ADDR_LEN])> {
     use bip32::{DerivationPath, XPrv};
-    let path_str = format!("m/{}'/{}'/{}'/{}'/{}", BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index);
-    let path: DerivationPath = path_str.parse().map_err(|e| anyhow::anyhow!("path: {:?}", e))?;
-    let xprv = XPrv::derive_from_path(seed, &path).map_err(|e| anyhow::anyhow!("derive: {:?}", e))?;
+    let path_str = format!(
+        "m/{}'/{}'/{}'/{}'/{}",
+        BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index
+    );
+    let path: DerivationPath = path_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("path: {:?}", e))?;
+    let xprv =
+        XPrv::derive_from_path(seed, &path).map_err(|e| anyhow::anyhow!("derive: {:?}", e))?;
     let mut sk = [0u8; 32];
     sk.copy_from_slice(&xprv.to_bytes());
     let secp = secp256k1::Secp256k1::new();
-    let pk = secp256k1::PublicKey::from_secret_key(&secp, &secp256k1::SecretKey::from_slice(&sk).map_err(|e| anyhow::anyhow!("{:?}", e))?);
+    let pk = secp256k1::PublicKey::from_secret_key(
+        &secp,
+        &secp256k1::SecretKey::from_slice(&sk).map_err(|e| anyhow::anyhow!("{:?}", e))?,
+    );
     let mut hash = [0u8; 32];
     let mut keccak = Keccak::v256();
     keccak.update(&pk.serialize_uncompressed()[1..]);
@@ -73,14 +86,27 @@ fn derive_eth_privkey_and_address(seed: &[u8; 64], account: u32, index: u32) -> 
 
 // ── BF 加载（支持三指纹：.bin + .alt.bin + .alt2.bin，无 alt/alt2 时退化为双指纹或单指纹） ──
 
-struct BfTriple(pub BinaryFuse16, pub Option<BinaryFuse16>, pub Option<BinaryFuse16>);
+struct BfTriple(
+    pub BinaryFuse16,
+    pub Option<BinaryFuse16>,
+    pub Option<BinaryFuse16>,
+);
 
 fn load_all_bf(fetcher_dir: &Path) -> Result<Vec<BfTriple>> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(fetcher_dir).with_context(|| format!("read_dir {}", fetcher_dir.display()))?
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(fetcher_dir)
+        .with_context(|| format!("read_dir {}", fetcher_dir.display()))?
         .filter_map(|e| {
             let p = e.ok()?.path();
             let n = p.file_name()?.to_string_lossy().to_string();
-            if n.starts_with("filter.") && n.ends_with(".bin") && !n.contains(".alt") && n.contains('-') { Some(p) } else { None }
+            if n.starts_with("filter.")
+                && n.ends_with(".bin")
+                && !n.contains(".alt")
+                && n.contains('-')
+            {
+                Some(p)
+            } else {
+                None
+            }
         })
         .collect();
     paths.sort();
@@ -91,8 +117,22 @@ fn load_all_bf(fetcher_dir: &Path) -> Result<Vec<BfTriple>> {
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let alt_path = parent.join(format!("{}.alt.bin", stem));
         let alt2_path = parent.join(format!("{}.alt2.bin", stem));
-        let f2 = if alt_path.exists() { Some(filter::load_fuse16(&alt_path).with_context(|| format!("load alt {}", alt_path.display()))?) } else { None };
-        let f3 = if alt2_path.exists() { Some(filter::load_fuse16(&alt2_path).with_context(|| format!("load alt2 {}", alt2_path.display()))?) } else { None };
+        let f2 = if alt_path.exists() {
+            Some(
+                filter::load_fuse16(&alt_path)
+                    .with_context(|| format!("load alt {}", alt_path.display()))?,
+            )
+        } else {
+            None
+        };
+        let f3 = if alt2_path.exists() {
+            Some(
+                filter::load_fuse16(&alt2_path)
+                    .with_context(|| format!("load alt2 {}", alt2_path.display()))?,
+            )
+        } else {
+            None
+        };
         triples.push(BfTriple(f1, f2, f3));
     }
     Ok(triples)
@@ -103,9 +143,13 @@ fn contains_bf(triples: &[BfTriple], addr: &[u8; ADDR_LEN]) -> bool {
     let fp2 = filter::addr_to_u64_alt(addr);
     let fp3 = filter::addr_to_u64_alt2(addr);
     triples.iter().any(|BfTriple(f1, alt, alt2)| {
-        if let (Some(f2), Some(f3)) = (alt, alt2) { f1.contains(&fp1) && f2.contains(&fp2) && f3.contains(&fp3) }
-        else if let Some(f2) = alt { f1.contains(&fp1) && f2.contains(&fp2) }
-        else { f1.contains(&fp1) }
+        if let (Some(f2), Some(f3)) = (alt, alt2) {
+            f1.contains(&fp1) && f2.contains(&fp2) && f3.contains(&fp3)
+        } else if let Some(f2) = alt {
+            f1.contains(&fp1) && f2.contains(&fp2)
+        } else {
+            f1.contains(&fp1)
+        }
     })
 }
 
@@ -118,25 +162,38 @@ pub fn bf_contains(fetcher_dir: &Path, addr: &[u8; ADDR_LEN]) -> Result<bool> {
 // ── 派生候选 ──
 
 fn load_derivation_candidates(path: &Path) -> Result<Vec<u32>> {
-    anyhow::ensure!(path.exists(), "派生候选文件不存在: {}，请先运行 birdhash init", path.display());
+    anyhow::ensure!(
+        path.exists(),
+        "派生候选文件不存在: {}，请先运行 birdhash init",
+        path.display()
+    );
     let f = File::open(path)?;
     let mut out = Vec::new();
     for line in BufReader::new(f).lines() {
         let s = line?.trim().to_string();
-        if s.is_empty() || s.starts_with('#') { continue; }
-        if let Ok(n) = s.parse::<u32>() { out.push(n); }
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        if let Ok(n) = s.parse::<u32>() {
+            out.push(n);
+        }
     }
     anyhow::ensure!(!out.is_empty(), "派生候选为空");
     Ok(out)
 }
 
-fn paths_per_id(candidates: &[u32]) -> u64 { 112 * candidates.len() as u64 }
+fn paths_per_id(candidates: &[u32]) -> u64 {
+    112 * candidates.len() as u64
+}
 
 fn path_index_to_account_index(path_index: u64, candidates: &[u32]) -> (u32, u32) {
     let n = candidates.len() as u64;
     let account = (path_index / n) as u32;
     let idx_pos = (path_index % n) as usize;
-    (account.min(ACCOUNT_MAX), candidates[idx_pos.min(candidates.len().saturating_sub(1))])
+    (
+        account.min(ACCOUNT_MAX),
+        candidates[idx_pos.min(candidates.len().saturating_sub(1))],
+    )
 }
 
 // ── 种子 ──
@@ -145,7 +202,9 @@ pub fn load_or_create_seed(path: &Path) -> Result<[u8; 32]> {
     if path.exists() {
         let b = std::fs::read(path).with_context(|| format!("read seed {}", path.display()))?;
         anyhow::ensure!(b.len() == 32, "seed 须为 32 字节");
-        let mut out = [0u8; 32]; out.copy_from_slice(&b); return Ok(out);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&b);
+        return Ok(out);
     }
     write_new_seed(path)
 }
@@ -153,8 +212,11 @@ pub fn load_or_create_seed(path: &Path) -> Result<[u8; 32]> {
 /// 生成新的 32 字节随机种子并写入，覆盖已有文件（init 时调用）
 pub fn write_new_seed(path: &Path) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
-    use rand::RngCore; rand::thread_rng().fill_bytes(&mut out);
-    if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
+    use rand::RngCore;
+    rand::thread_rng().fill_bytes(&mut out);
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
     std::fs::write(path, &out)?;
     Ok(out)
 }
@@ -162,17 +224,25 @@ pub fn write_new_seed(path: &Path) -> Result<[u8; 32]> {
 // ── 检查点 ──
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
-struct Checkpoint { next_address_index: u64 }
+struct Checkpoint {
+    next_address_index: u64,
+}
 
 fn load_checkpoint(path: &Path) -> u64 {
-    std::fs::read_to_string(path).ok()
+    std::fs::read_to_string(path)
+        .ok()
         .and_then(|s| serde_json::from_str::<Checkpoint>(&s).ok())
-        .map(|c| c.next_address_index).unwrap_or(0)
+        .map(|c| c.next_address_index)
+        .unwrap_or(0)
 }
 
 fn save_checkpoint(path: &Path, n: u64) -> Result<()> {
-    let cp = Checkpoint { next_address_index: n };
-    if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
+    let cp = Checkpoint {
+        next_address_index: n,
+    };
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_string(&cp)?)?;
     std::fs::rename(&tmp, path)?;
@@ -182,21 +252,42 @@ fn save_checkpoint(path: &Path, n: u64) -> Result<()> {
 // ── CSV ──
 
 fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 fn ensure_hits_csv(path: &Path) -> Result<()> {
-    if path.exists() { return Ok(()); }
-    if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
     let mut f = File::create(path)?;
     writeln!(f, "地址,私钥,派生路径,助记词")?;
     Ok(())
 }
 
-fn append_hit(path: &Path, addr: &[u8; ADDR_LEN], privkey: &[u8; 32], deriv_path: &str, mnemonic: &str) -> Result<()> {
+fn append_hit(
+    path: &Path,
+    addr: &[u8; ADDR_LEN],
+    privkey: &[u8; 32],
+    deriv_path: &str,
+    mnemonic: &str,
+) -> Result<()> {
     ensure_hits_csv(path)?;
     let mut f = OpenOptions::new().append(true).open(path)?;
-    writeln!(f, "0x{},{},{},{}", hex::encode(addr), hex::encode(privkey), csv_escape(deriv_path), csv_escape(mnemonic))?;
+    writeln!(
+        f,
+        "0x{},{},{},{}",
+        hex::encode(addr),
+        hex::encode(privkey),
+        csv_escape(deriv_path),
+        csv_escape(mnemonic)
+    )?;
     f.flush()?;
     Ok(())
 }
@@ -216,7 +307,10 @@ pub fn run_collider(cfg: &AppConfig, num_threads: usize) -> Result<()> {
 
     let bf_filters = load_all_bf(&fetcher_dir)?;
     let bf_count = bf_filters.len();
-    anyhow::ensure!(!bf_filters.is_empty(), "未找到 BF 过滤器，请先运行 birdhash fetch + build-filter");
+    anyhow::ensure!(
+        !bf_filters.is_empty(),
+        "未找到 BF 过滤器，请先运行 birdhash fetch + build-filter"
+    );
     let bf = Arc::new(RwLock::new(bf_filters));
 
     let start_n = load_checkpoint(&checkpoint_path);
@@ -224,24 +318,33 @@ pub fn run_collider(cfg: &AppConfig, num_threads: usize) -> Result<()> {
     let total_generated = Arc::new(AtomicU64::new(0));
     let total_hits = Arc::new(AtomicU64::new(0));
 
-    println!("  碰撞器启动 | BF {} 个 | 种子 {} | 候选 {} | 路径/ID {} | 线程 {} | 断点 N={}",
-        bf_count, cfg.generator_seed_path().display(), candidates.len(), paths_per, num_threads, start_n);
-    println!("  命中写入 {} | 检查点 {}", hits_csv.display(), checkpoint_path.display());
+    println!(
+        "  碰撞器启动 | BF {} 个 | 种子 {} | 候选 {} | 路径/ID {} | 线程 {} | 断点 N={}",
+        bf_count,
+        cfg.generator_seed_path().display(),
+        candidates.len(),
+        paths_per,
+        num_threads,
+        start_n
+    );
+    println!(
+        "  命中写入 {} | 检查点 {}",
+        hits_csv.display(),
+        checkpoint_path.display()
+    );
 
     // BF 热更新线程
     let bf_reload = Arc::clone(&bf);
     let fetcher_dir_reload = fetcher_dir.clone();
-    thread::spawn(move || {
-        loop {
-            thread::sleep(std::time::Duration::from_secs(BF_RELOAD_INTERVAL_SECS));
-            match load_all_bf(&fetcher_dir_reload) {
-                Ok(new_filters) if !new_filters.is_empty() => {
-                    let n = new_filters.len();
-                    *bf_reload.write().unwrap() = new_filters;
-                    log::info!("BF 热更新: {} 个过滤器", n);
-                }
-                _ => {}
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_secs(BF_RELOAD_INTERVAL_SECS));
+        match load_all_bf(&fetcher_dir_reload) {
+            Ok(new_filters) if !new_filters.is_empty() => {
+                let n = new_filters.len();
+                *bf_reload.write().unwrap() = new_filters;
+                log::info!("BF 热更新: {} 个过滤器", n);
             }
+            _ => {}
         }
     });
 
@@ -254,22 +357,29 @@ pub fn run_collider(cfg: &AppConfig, num_threads: usize) -> Result<()> {
         let tot = Arc::clone(&total_generated);
         let hits = Arc::clone(&total_hits);
         let csv_path = hits_csv.clone();
-        thread::spawn(move || {
-            loop {
-                let n = next.fetch_add(1, Ordering::SeqCst);
-                let id = n / paths_per;
-                let path_index = n % paths_per;
-                let (account, index) = path_index_to_account_index(path_index, &cand);
-                let (phrase, seed) = match id_to_mnemonic_and_seed(&sk, id) { Ok(x) => x, Err(_) => continue };
-                let (privkey, addr) = match derive_eth_privkey_and_address(&seed, account, index) { Ok(x) => x, Err(_) => continue };
-                tot.fetch_add(1, Ordering::Relaxed);
-                let bf_guard = bf.read().unwrap();
-                if contains_bf(&bf_guard, &addr) {
-                    drop(bf_guard);
-                    let path_str = format!("m/{}'/{}'/{}'/{}'/{}", BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index);
-                    let _ = append_hit(&csv_path, &addr, &privkey, &path_str, &phrase);
-                    hits.fetch_add(1, Ordering::Relaxed);
-                }
+        thread::spawn(move || loop {
+            let n = next.fetch_add(1, Ordering::SeqCst);
+            let id = n / paths_per;
+            let path_index = n % paths_per;
+            let (account, index) = path_index_to_account_index(path_index, &cand);
+            let (phrase, seed) = match id_to_mnemonic_and_seed(&sk, id) {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            let (privkey, addr) = match derive_eth_privkey_and_address(&seed, account, index) {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            tot.fetch_add(1, Ordering::Relaxed);
+            let bf_guard = bf.read().unwrap();
+            if contains_bf(&bf_guard, &addr) {
+                drop(bf_guard);
+                let path_str = format!(
+                    "m/{}'/{}'/{}'/{}'/{}",
+                    BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index
+                );
+                let _ = append_hit(&csv_path, &addr, &privkey, &path_str, &phrase);
+                hits.fetch_add(1, Ordering::Relaxed);
             }
         });
     }
@@ -286,8 +396,10 @@ pub fn run_collider(cfg: &AppConfig, num_threads: usize) -> Result<()> {
         let rate = total as f64 / elapsed.max(0.001);
         let current_id = n / paths_per;
         let bf_count = bf.read().map(|g| g.len()).unwrap_or(0);
-        print!("\r  N={} | ID={} | 速度 {:.0}/s | 已生成 {} | 命中 {} | BF {} 个  ",
-            n, current_id, rate, total, hit_count, bf_count);
+        print!(
+            "\r  N={} | ID={} | 速度 {:.0}/s | 已生成 {} | 命中 {} | BF {} 个  ",
+            n, current_id, rate, total, hit_count, bf_count
+        );
         let _ = std::io::stdout().flush();
     }
 }

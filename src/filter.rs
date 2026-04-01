@@ -21,8 +21,12 @@ pub fn build_fuse16(keys: &[u64]) -> Result<BinaryFuse16> {
 
 #[inline]
 pub fn addr_to_u64(addr: &[u8; 20]) -> u64 {
-    let a = u64::from_le_bytes([addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]]);
-    let b = u64::from_le_bytes([addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15]]);
+    let a = u64::from_le_bytes([
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+    ]);
+    let b = u64::from_le_bytes([
+        addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15],
+    ]);
     let c = u32::from_le_bytes([addr[16], addr[17], addr[18], addr[19]]) as u64;
     let mut h = a;
     h ^= b.wrapping_mul(0x517cc1b727220a95);
@@ -38,8 +42,12 @@ pub fn addr_to_u64(addr: &[u8; 20]) -> u64 {
 /// 与 addr_to_u64 独立的第二指纹（不同混合常数），用于双指纹 128 位降假阳
 #[inline]
 pub fn addr_to_u64_alt(addr: &[u8; 20]) -> u64 {
-    let a = u64::from_le_bytes([addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]]);
-    let b = u64::from_le_bytes([addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15]]);
+    let a = u64::from_le_bytes([
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+    ]);
+    let b = u64::from_le_bytes([
+        addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15],
+    ]);
     let c = u32::from_le_bytes([addr[16], addr[17], addr[18], addr[19]]) as u64;
     let mut h = b;
     h ^= a.wrapping_mul(0x9e3779b97f4a7c15);
@@ -55,8 +63,12 @@ pub fn addr_to_u64_alt(addr: &[u8; 20]) -> u64 {
 /// 第三指纹（与 fp1/fp2 独立），用于三指纹 192 位进一步降假阳
 #[inline]
 pub fn addr_to_u64_alt2(addr: &[u8; 20]) -> u64 {
-    let a = u64::from_le_bytes([addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7]]);
-    let b = u64::from_le_bytes([addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15]]);
+    let a = u64::from_le_bytes([
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+    ]);
+    let b = u64::from_le_bytes([
+        addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15],
+    ]);
     let c = u32::from_le_bytes([addr[16], addr[17], addr[18], addr[19]]) as u64;
     let mut h = c;
     h ^= a.wrapping_mul(0x6c62272e07bb0142);
@@ -70,7 +82,9 @@ pub fn addr_to_u64_alt2(addr: &[u8; 20]) -> u64 {
 }
 
 pub fn save_fuse16(filter: &BinaryFuse16, path: &Path) -> Result<()> {
-    if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
     let data = bincode::serialize(filter)?;
     atomic_write(path, &data)
 }
@@ -96,7 +110,9 @@ mod tests {
     fn fuse16_build_and_query() {
         let keys: Vec<u64> = (0..10_000).collect();
         let f = build_fuse16(&keys).unwrap();
-        for &k in &keys { assert!(f.contains(&k)); }
+        for &k in &keys {
+            assert!(f.contains(&k));
+        }
     }
 
     #[test]
@@ -106,7 +122,9 @@ mod tests {
         let tmp = std::env::temp_dir().join("birdhash_test_fuse16.bin");
         save_fuse16(&f, &tmp).unwrap();
         let f2 = load_fuse16(&tmp).unwrap();
-        for &k in &keys { assert!(f2.contains(&k)); }
+        for &k in &keys {
+            assert!(f2.contains(&k));
+        }
         let _ = std::fs::remove_file(&tmp);
     }
 

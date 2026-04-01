@@ -42,23 +42,39 @@ fn id_to_mnemonic_and_seed(seed_key: &[u8], id: u64) -> Result<(String, [u8; 64]
     let m = Mnemonic::from_entropy(entropy, Language::English);
     let phrase = m.phrase().to_string();
     let seed = m.to_seed("");
-    let mut out = [0u8; 64]; out.copy_from_slice(seed.as_ref());
+    let mut out = [0u8; 64];
+    out.copy_from_slice(seed.as_ref());
     Ok((phrase, out))
 }
 
-fn derive_eth_privkey_and_address(seed: &[u8; 64], account: u32, index: u32) -> Result<([u8; 32], [u8; ADDR_LEN])> {
+fn derive_eth_privkey_and_address(
+    seed: &[u8; 64],
+    account: u32,
+    index: u32,
+) -> Result<([u8; 32], [u8; ADDR_LEN])> {
     use bip32::{DerivationPath, XPrv};
-    let path_str = format!("m/{}'/{}'/{}'/{}'/{}", BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index);
-    let path: DerivationPath = path_str.parse().map_err(|e| anyhow::anyhow!("path: {:?}", e))?;
-    let xprv = XPrv::derive_from_path(seed, &path).map_err(|e| anyhow::anyhow!("derive: {:?}", e))?;
-    let mut sk = [0u8; 32]; sk.copy_from_slice(&xprv.to_bytes());
+    let path_str = format!(
+        "m/{}'/{}'/{}'/{}'/{}",
+        BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index
+    );
+    let path: DerivationPath = path_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("path: {:?}", e))?;
+    let xprv =
+        XPrv::derive_from_path(seed, &path).map_err(|e| anyhow::anyhow!("derive: {:?}", e))?;
+    let mut sk = [0u8; 32];
+    sk.copy_from_slice(&xprv.to_bytes());
     let secp = secp256k1::Secp256k1::new();
-    let pk = secp256k1::PublicKey::from_secret_key(&secp, &secp256k1::SecretKey::from_slice(&sk).map_err(|e| anyhow::anyhow!("{:?}", e))?);
+    let pk = secp256k1::PublicKey::from_secret_key(
+        &secp,
+        &secp256k1::SecretKey::from_slice(&sk).map_err(|e| anyhow::anyhow!("{:?}", e))?,
+    );
     let mut hash = [0u8; 32];
     let mut keccak = Keccak::v256();
     keccak.update(&pk.serialize_uncompressed()[1..]);
     keccak.finalize(&mut hash);
-    let mut addr = [0u8; ADDR_LEN]; addr.copy_from_slice(&hash[12..]);
+    let mut addr = [0u8; ADDR_LEN];
+    addr.copy_from_slice(&hash[12..]);
     Ok((sk, addr))
 }
 
@@ -68,15 +84,23 @@ pub fn load_derivation_candidates(path: &Path) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     for line in BufReader::new(f).lines() {
         let s = line?.trim().to_string();
-        if s.is_empty() || s.starts_with('#') { continue; }
-        if let Ok(n) = s.parse::<u32>() { out.push(n); }
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        if let Ok(n) = s.parse::<u32>() {
+            out.push(n);
+        }
     }
     anyhow::ensure!(!out.is_empty(), "派生候选为空");
     Ok(out)
 }
 
 fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 pub fn export_id_all_derivations_to_csv(cfg: &AppConfig, id: u64, out_path: &Path) -> Result<()> {
@@ -84,16 +108,41 @@ pub fn export_id_all_derivations_to_csv(cfg: &AppConfig, id: u64, out_path: &Pat
     let seed_key = load_or_create_seed(&cfg.generator_seed_path())?;
     let candidates = load_derivation_candidates(&cfg.derivation_candidates_path())?;
     let (phrase, seed) = id_to_mnemonic_and_seed(&seed_key, id)?;
-    let first3: String = phrase.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
-    if let Some(p) = out_path.parent() { std::fs::create_dir_all(p)?; }
+    let first3: String = phrase
+        .split_whitespace()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(p) = out_path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
     let mut f = File::create(out_path)?;
-    writeln!(f, "id,mnemonic_first3,account,index,derivation_path,privkey_hex,address_hex")?;
+    writeln!(
+        f,
+        "id,mnemonic_first3,account,index,derivation_path,privkey_hex,address_hex"
+    )?;
     let mut rows = 0u64;
     for account in 0..=ACCOUNT_MAX {
         for &index in &candidates {
-            let path_str = format!("m/{}'/{}'/{}'/{}'/{}", BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index);
-            let (privkey, addr) = match derive_eth_privkey_and_address(&seed, account, index) { Ok(x) => x, Err(_) => continue };
-            writeln!(f, "{},{},{},{},{},{},0x{}", id, csv_escape(&first3), account, index, csv_escape(&path_str), hex::encode(privkey), hex::encode(addr))?;
+            let path_str = format!(
+                "m/{}'/{}'/{}'/{}'/{}",
+                BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index
+            );
+            let (privkey, addr) = match derive_eth_privkey_and_address(&seed, account, index) {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            writeln!(
+                f,
+                "{},{},{},{},{},{},0x{}",
+                id,
+                csv_escape(&first3),
+                account,
+                index,
+                csv_escape(&path_str),
+                hex::encode(privkey),
+                hex::encode(addr)
+            )?;
             rows += 1;
         }
     }
@@ -108,14 +157,27 @@ pub fn print_id_details(cfg: &AppConfig, id: u64) -> Result<()> {
     let (phrase, seed) = id_to_mnemonic_and_seed(&seed_key, id)?;
     let account = 0u32;
     let index = *candidates.first().unwrap_or(&0);
-    let path_str = format!("m/{}'/{}'/{}'/{}'/{}", BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index);
+    let path_str = format!(
+        "m/{}'/{}'/{}'/{}'/{}",
+        BIP44_PURPOSE, BIP44_COIN_TYPE_ETH, account, BIP44_CHANGE, index
+    );
     let (privkey, addr) = derive_eth_privkey_and_address(&seed, account, index)?;
-    let first3: String = phrase.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    let first3: String = phrase
+        .split_whitespace()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
     println!("═══════════════════════════════════════════════════════════════");
     println!("  ID:           {}", id);
     println!("  助记词(前3):  {}", first3);
     println!("  助记词(完整): {}", phrase);
-    println!("  示例路径:     {}  (account={} index={}, 共 112×{} 条路径)", path_str, account, index, candidates.len());
+    println!(
+        "  示例路径:     {}  (account={} index={}, 共 112×{} 条路径)",
+        path_str,
+        account,
+        index,
+        candidates.len()
+    );
     println!("  私钥(hex):    {}", hex::encode(privkey));
     println!("  地址:         0x{}", hex::encode(addr));
     println!("═══════════════════════════════════════════════════════════════");
