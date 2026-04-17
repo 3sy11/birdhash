@@ -171,13 +171,7 @@ pub fn print_id_details(cfg: &AppConfig, id: u64) -> Result<()> {
     println!("  ID:           {}", id);
     println!("  助记词(前3):  {}", first3);
     println!("  助记词(完整): {}", phrase);
-    println!(
-        "  示例路径:     {}  (account={} index={}, 共 112×{} 条路径)",
-        path_str,
-        account,
-        index,
-        candidates.len()
-    );
+    println!("  示例路径:     {}  (account={} index={}, 共 {}×{} 条路径)", path_str, account, index, ACCOUNT_MAX + 1, candidates.len());
     println!("  私钥(hex):    {}", hex::encode(privkey));
     println!("  地址:         0x{}", hex::encode(addr));
     println!("═══════════════════════════════════════════════════════════════");

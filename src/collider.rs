@@ -182,9 +182,7 @@ fn load_derivation_candidates(path: &Path) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-fn paths_per_id(candidates: &[u32]) -> u64 {
-    112 * candidates.len() as u64
-}
+fn paths_per_id(candidates: &[u32]) -> u64 { (ACCOUNT_MAX as u64 + 1) * candidates.len() as u64 }
 
 fn path_index_to_account_index(path_index: u64, candidates: &[u32]) -> (u32, u32) {
     let n = candidates.len() as u64;
