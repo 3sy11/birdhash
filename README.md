@@ -111,12 +111,23 @@ birdhash fetch-test --rpc https://eth.llamarpc.com --block 19000000
 启动碰撞器：多线程按 ID 派生地址，与 BF 碰撞，命中写入 `data/results/hits_bf.csv`，检查点 `data/results/collider_cursor.json`。
 
 ```bash
-# 默认 4 线程
+# 默认 4 线程（纯 CPU 模式）
 birdhash collide
 
 # 指定线程数
 birdhash collide --threads 8
+
+# GPU 加速模式（需要 NVIDIA 驱动，无需 CUDA Toolkit）
+# CPU 负责 BIP39/PBKDF2，GPU 批量执行 BIP32+secp256k1+Keccak-256
+birdhash collide --gpu
+birdhash collide --gpu --threads 8   # --threads 控制 CPU PBKDF2 并行度
 ```
+
+**GPU 模式说明**
+- 需要已安装 NVIDIA 驱动（`nvcuda.dll`），不需要 CUDA Toolkit / nvcc
+- Kernel 编译为 PTX，由驱动 JIT 加速到本机 GPU 架构
+- 每轮 batch 512 个 seed × 全部路径，并行度可达数万线程
+- 推荐 `--threads` 设为 CPU 核心数（PBKDF2 并行度），GPU 自动满负荷运行
 
 ### id-info
 

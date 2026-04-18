@@ -31,6 +31,10 @@ toml = "0.8"
 rlp = "0.5"
 indicatif = "0.17"
 bip32 = "0.5"
+libloading = "0.8"
+
+[build-dependencies]
+# build.rs 编译 GPU kernel 到 PTX（使用 nightly rustc，仅构建时需要）
 
 [profile.release]
 opt-level = 3

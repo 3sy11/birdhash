@@ -4,6 +4,7 @@ mod derivation;
 mod fetcher;
 mod filter;
 mod generator;
+mod gpu_collider;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::Write;
@@ -63,9 +64,12 @@ enum Commands {
     },
     /// 碰撞器：N 线程生成地址，实时与 BF 碰撞，命中写 CSV，支持断点续碰
     Collide {
-        /// worker 线程数（默认 4）
+        /// worker 线程数（默认 4，--gpu 时为 CPU PBKDF2 线程数）
         #[arg(long, default_value = "4")]
         threads: usize,
+        /// 使用 NVIDIA GPU（CUDA）加速派生，需要已安装 N 卡驱动
+        #[arg(long)]
+        gpu: bool,
     },
     /// 查询 ID 的助记词/地址/私钥信息，或导出全部派生 CSV
     IdInfo {
@@ -105,7 +109,7 @@ fn main() -> Result<()> {
             cmd_filter_query(cfg, &address, filter.as_deref())
         }
         Commands::FetchTest { rpc, block } => cmd_fetch_test(cfg, rpc, block),
-        Commands::Collide { threads } => cmd_collide(cfg, threads),
+        Commands::Collide { threads, gpu } => cmd_collide(cfg, threads, gpu),
         Commands::IdInfo { id, all } => cmd_id_info(cfg, id, all),
     }
 }
@@ -525,8 +529,13 @@ fn resolve_rpc_urls(cfg: &config::AppConfig, rpc_cli: Option<String>) -> Result<
     Ok(urls)
 }
 
-fn cmd_collide(cfg: config::AppConfig, threads: usize) -> Result<()> {
-    collider::run_collider(&cfg, threads)
+fn cmd_collide(cfg: config::AppConfig, threads: usize, gpu: bool) -> Result<()> {
+    if gpu {
+        log::info!("使用 GPU 模式，CPU PBKDF2 线程={}", threads);
+        gpu_collider::run_gpu_collider(&cfg, threads)
+    } else {
+        collider::run_collider(&cfg, threads)
+    }
 }
 
 fn cmd_id_info(cfg: config::AppConfig, id: u64, all: bool) -> Result<()> {

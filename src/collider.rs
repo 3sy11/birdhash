@@ -86,13 +86,13 @@ fn derive_eth_privkey_and_address(
 
 // ── BF 加载（支持三指纹：.bin + .alt.bin + .alt2.bin，无 alt/alt2 时退化为双指纹或单指纹） ──
 
-struct BfTriple(
+pub(crate) struct BfTriple(
     pub BinaryFuse16,
     pub Option<BinaryFuse16>,
     pub Option<BinaryFuse16>,
 );
 
-fn load_all_bf(fetcher_dir: &Path) -> Result<Vec<BfTriple>> {
+pub(crate) fn load_all_bf(fetcher_dir: &Path) -> Result<Vec<BfTriple>> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(fetcher_dir)
         .with_context(|| format!("read_dir {}", fetcher_dir.display()))?
         .filter_map(|e| {
@@ -138,7 +138,7 @@ fn load_all_bf(fetcher_dir: &Path) -> Result<Vec<BfTriple>> {
     Ok(triples)
 }
 
-fn contains_bf(triples: &[BfTriple], addr: &[u8; ADDR_LEN]) -> bool {
+pub(crate) fn contains_bf(triples: &[BfTriple], addr: &[u8; ADDR_LEN]) -> bool {
     let fp1 = filter::addr_to_u64(addr);
     let fp2 = filter::addr_to_u64_alt(addr);
     let fp3 = filter::addr_to_u64_alt2(addr);
@@ -161,7 +161,7 @@ pub fn bf_contains(fetcher_dir: &Path, addr: &[u8; ADDR_LEN]) -> Result<bool> {
 
 // ── 派生候选 ──
 
-fn load_derivation_candidates(path: &Path) -> Result<Vec<u32>> {
+pub(crate) fn load_derivation_candidates(path: &Path) -> Result<Vec<u32>> {
     anyhow::ensure!(
         path.exists(),
         "派生候选文件不存在: {}，请先运行 birdhash init",
@@ -182,9 +182,9 @@ fn load_derivation_candidates(path: &Path) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-fn paths_per_id(candidates: &[u32]) -> u64 { (ACCOUNT_MAX as u64 + 1) * candidates.len() as u64 }
+pub(crate) fn paths_per_id(candidates: &[u32]) -> u64 { (ACCOUNT_MAX as u64 + 1) * candidates.len() as u64 }
 
-fn path_index_to_account_index(path_index: u64, candidates: &[u32]) -> (u32, u32) {
+pub(crate) fn path_index_to_account_index(path_index: u64, candidates: &[u32]) -> (u32, u32) {
     let n = candidates.len() as u64;
     let account = (path_index / n) as u32;
     let idx_pos = (path_index % n) as usize;
@@ -226,7 +226,7 @@ struct Checkpoint {
     next_address_index: u64,
 }
 
-fn load_checkpoint(path: &Path) -> u64 {
+pub(crate) fn load_checkpoint(path: &Path) -> u64 {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<Checkpoint>(&s).ok())
@@ -234,7 +234,7 @@ fn load_checkpoint(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn save_checkpoint(path: &Path, n: u64) -> Result<()> {
+pub(crate) fn save_checkpoint(path: &Path, n: u64) -> Result<()> {
     let cp = Checkpoint {
         next_address_index: n,
     };
@@ -257,7 +257,7 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
-fn ensure_hits_csv(path: &Path) -> Result<()> {
+pub(crate) fn ensure_hits_csv(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
@@ -269,7 +269,7 @@ fn ensure_hits_csv(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn append_hit(
+pub(crate) fn append_hit(
     path: &Path,
     addr: &[u8; ADDR_LEN],
     privkey: &[u8; 32],
