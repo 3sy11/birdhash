@@ -50,38 +50,30 @@ struct TomlFetcher {
 }
 
 impl AppConfig {
-    pub fn generator_dir(&self) -> PathBuf {
-        self.data_dir.join("generator")
-    }
-    pub fn fetcher_dir(&self) -> PathBuf {
-        self.data_dir.join("fetcher")
-    }
-    pub fn results_dir(&self) -> PathBuf {
-        self.data_dir.join("results")
-    }
-    pub fn collider_cursor_path(&self) -> PathBuf {
-        self.results_dir().join("collider_cursor.json")
-    }
-    pub fn hits_bf_csv_path(&self) -> PathBuf {
-        self.results_dir().join("hits_bf.csv")
-    }
-    pub fn fetcher_ranges_dir(&self) -> PathBuf {
-        self.fetcher_dir().join("ranges")
-    }
-    pub fn derivation_candidates_path(&self) -> PathBuf {
-        self.assets_dir
-            .join("derivation_candidates")
-            .join("derivation_candidates.txt")
-    }
-    pub fn generator_seed_path(&self) -> PathBuf {
-        self.assets_dir.join("generator_seed.key")
-    }
+    pub fn generator_dir(&self) -> PathBuf { self.data_dir.join("generator") }
+    pub fn results_dir(&self) -> PathBuf { self.data_dir.join("results") }
+    pub fn derivation_candidates_path(&self) -> PathBuf { self.assets_dir.join("derivation_candidates").join("derivation_candidates.txt") }
+    pub fn generator_seed_path(&self) -> PathBuf { self.assets_dir.join("generator_seed.key") }
+
+    // 带 chain 标识的路径（chain="eth" 时目录名为 fetcher_eth、results_eth 等）
+    pub fn fetcher_dir_for(&self, chain: &str) -> PathBuf { self.data_dir.join(format!("fetcher_{}", chain)) }
+    pub fn fetcher_ranges_dir_for(&self, chain: &str) -> PathBuf { self.fetcher_dir_for(chain).join("ranges") }
+    pub fn results_dir_for(&self, chain: &str) -> PathBuf { self.data_dir.join(format!("results_{}", chain)) }
+    pub fn collider_cursor_path_for(&self, chain: &str) -> PathBuf { self.results_dir_for(chain).join("collider_cursor.json") }
+    pub fn hits_bf_csv_path_for(&self, chain: &str) -> PathBuf { self.results_dir_for(chain).join("hits_bf.csv") }
 
     pub fn ensure_dirs(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.data_dir)?;
-        std::fs::create_dir_all(self.fetcher_dir())?;
-        std::fs::create_dir_all(self.fetcher_ranges_dir())?;
+        std::fs::create_dir_all(self.generator_dir())?;
         std::fs::create_dir_all(self.results_dir())?;
+        Ok(())
+    }
+
+    pub fn ensure_chain_dirs(&self, chain: &str) -> anyhow::Result<()> {
+        self.ensure_dirs()?;
+        std::fs::create_dir_all(self.fetcher_dir_for(chain))?;
+        std::fs::create_dir_all(self.fetcher_ranges_dir_for(chain))?;
+        std::fs::create_dir_all(self.results_dir_for(chain))?;
         Ok(())
     }
 

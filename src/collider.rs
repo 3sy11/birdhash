@@ -86,11 +86,15 @@ fn derive_eth_privkey_and_address(
 
 // ── BF 加载（支持三指纹：.bin + .alt.bin + .alt2.bin，无 alt/alt2 时退化为双指纹或单指纹） ──
 
-pub(crate) struct BfTriple(
+pub struct BfTriple(
     pub BinaryFuse16,
     pub Option<BinaryFuse16>,
     pub Option<BinaryFuse16>,
 );
+
+pub fn load_all_bf_pub(fetcher_dir: &Path) -> Result<Vec<BfTriple>> { load_all_bf(fetcher_dir) }
+
+pub fn contains_bf_pub(triples: &[BfTriple], addr: &[u8; ADDR_LEN]) -> bool { contains_bf(triples, addr) }
 
 pub(crate) fn load_all_bf(fetcher_dir: &Path) -> Result<Vec<BfTriple>> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(fetcher_dir)
@@ -292,15 +296,15 @@ pub(crate) fn append_hit(
 
 // ── 主入口 ──
 
-pub fn run_collider(cfg: &AppConfig, num_threads: usize) -> Result<()> {
-    cfg.ensure_dirs()?;
+pub fn run_collider(cfg: &AppConfig, chain: &str, num_threads: usize) -> Result<()> {
+    cfg.ensure_chain_dirs(chain)?;
     let seed_key = load_or_create_seed(&cfg.generator_seed_path())?;
     let candidates = load_derivation_candidates(&cfg.derivation_candidates_path())?;
     let candidates = Arc::new(candidates);
     let paths_per = paths_per_id(&candidates);
-    let checkpoint_path = cfg.collider_cursor_path();
-    let hits_csv = cfg.hits_bf_csv_path();
-    let fetcher_dir = cfg.fetcher_dir();
+    let checkpoint_path = cfg.collider_cursor_path_for(chain);
+    let hits_csv = cfg.hits_bf_csv_path_for(chain);
+    let fetcher_dir = cfg.fetcher_dir_for(chain);
     ensure_hits_csv(&hits_csv)?;
 
     let bf_filters = load_all_bf(&fetcher_dir)?;

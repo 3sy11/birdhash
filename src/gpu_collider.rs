@@ -132,18 +132,18 @@ impl Drop for DevBuf<'_> {
 
 // ── 主入口 ────────────────────────────────────────────────────────────────
 
-pub fn run_gpu_collider(cfg: &AppConfig, num_cpu_threads: usize) -> Result<()> {
+pub fn run_gpu_collider(cfg: &AppConfig, chain: &str, num_cpu_threads: usize) -> Result<()> {
     anyhow::ensure!(!PTX.is_empty(), "GPU kernel PTX 为空，请检查编译");
-    cfg.ensure_dirs()?;
+    cfg.ensure_chain_dirs(chain)?;
 
     let seed_key = load_or_create_seed(&cfg.generator_seed_path())?;
     let candidates = Arc::new(load_derivation_candidates(&cfg.derivation_candidates_path())?);
     let paths_per = paths_per_id(&candidates);
-    let hits_csv = cfg.hits_bf_csv_path();
-    let checkpoint_path = cfg.collider_cursor_path();
+    let hits_csv = cfg.hits_bf_csv_path_for(chain);
+    let checkpoint_path = cfg.collider_cursor_path_for(chain);
     ensure_hits_csv(&hits_csv)?;
 
-    let bf_filters = load_all_bf(&cfg.fetcher_dir())?;
+    let bf_filters = load_all_bf(&cfg.fetcher_dir_for(chain))?;
     anyhow::ensure!(!bf_filters.is_empty(), "未找到 BF 过滤器，请先 fetch + build-filter");
     let bf = Arc::new(bf_filters);
     // 预计算所有路径的 (account, index) 列表（供 GPU kernel 使用）
