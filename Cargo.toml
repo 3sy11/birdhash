@@ -30,6 +30,8 @@ ureq = { version = "2", features = ["json"] }
 toml = "0.8"
 rlp = "0.5"
 indicatif = "0.17"
+arrow = { version = "58", default-features = false }
+parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
 bip32 = "0.5"
 libloading = "0.8"
 

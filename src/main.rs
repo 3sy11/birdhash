@@ -227,7 +227,6 @@ fn cmd_build_filter(
     output: Option<&str>,
 ) -> Result<()> {
     use crate::filter;
-    use std::io::BufRead;
     let chain_suffix = format!("fetcher_{}", chain);
     let (range_root, out_dir) = if let Some(d) = data_dir {
         let base = std::path::PathBuf::from(d);
@@ -269,32 +268,7 @@ fn cmd_build_filter(
         _ => all_batches.clone(),
     };
 
-    // 第一步：合并各批次的小文件（排除「当前写入中」的批次）
-    let mut merged_count = 0usize;
-    for &bid in &batch_list {
-        let is_current = bid == current_batch && !current_batch_done;
-        if is_current {
-            println!(
-                "  batch={} 跳过合并（当前写入中，through={}/{}）",
-                bid, current_batch_through, current_batch_seg_end
-            );
-            continue;
-        }
-        let seg_s = (bid.saturating_sub(1)) * fetcher::SEGMENT_SIZE;
-        let range_dir = range_root.join(fetcher::seg_dir_name(seg_s));
-        let has_chunks =
-            (0..100u32).any(|i| range_dir.join(format!("chunk_{:03}.jsonl", i)).exists());
-        if has_chunks {
-            let lines = fetcher::merge_range_dir(&range_dir)?;
-            println!("  batch={} 合并完成，共 {} 行", bid, lines);
-            merged_count += 1;
-        }
-    }
-    if merged_count > 0 {
-        println!("合并了 {} 个批次的小文件", merged_count);
-    }
-
-    // 第二步：加载已有 BF，收集新地址（跳过已存在的）
+    // 加载已有 BF，用于增量去重
     let existing_bf = collider::load_all_bf_pub(&out_dir).unwrap_or_default();
     let has_existing = !existing_bf.is_empty();
     if has_existing { println!("已加载 {} 组已有 BF，增量构建：跳过已存在地址", existing_bf.len()); }
@@ -305,26 +279,25 @@ fn cmd_build_filter(
     let mut included_batches: Vec<u64> = Vec::new();
     for &bid in &batch_list {
         let is_current_writing = bid == current_batch && !current_batch_done;
-        if is_current_writing { continue; }
+        if is_current_writing {
+            println!("  batch={} 跳过（当前写入中，through={}/{}）", bid, current_batch_through, current_batch_seg_end);
+            continue;
+        }
         let seg_s = (bid.saturating_sub(1)) * fetcher::SEGMENT_SIZE;
         let range_dir = range_root.join(fetcher::seg_dir_name(seg_s));
-        let blocks_path = range_dir.join("blocks.jsonl");
-        if !blocks_path.exists() { continue; }
-        let f = std::fs::File::open(&blocks_path)?;
-        for line in std::io::BufReader::new(f).lines() {
-            let line = line?;
-            if line.trim().is_empty() { continue; }
-            let block: serde_json::Value = serde_json::from_str(&line)?;
-            for addr in fetcher::extract_addresses_from_block(&block) {
-                if has_existing && collider::contains_bf_pub(&existing_bf, &addr) {
-                    skipped_addrs += 1;
-                    continue;
-                }
-                set1.insert(filter::addr_to_u64(&addr));
-                set2.insert(filter::addr_to_u64_alt(&addr));
-                set3.insert(filter::addr_to_u64_alt2(&addr));
+        // 兼容 parquet + jsonl 两种格式
+        let addrs = fetcher::read_addresses_from_range_dir(&range_dir)?;
+        if addrs.is_empty() { continue; }
+        for addr in &addrs {
+            if has_existing && collider::contains_bf_pub(&existing_bf, addr) {
+                skipped_addrs += 1;
+                continue;
             }
+            set1.insert(filter::addr_to_u64(addr));
+            set2.insert(filter::addr_to_u64_alt(addr));
+            set3.insert(filter::addr_to_u64_alt2(addr));
         }
+        println!("  batch={} 读取 {} 个地址", bid, addrs.len());
         included_batches.push(bid);
     }
     if skipped_addrs > 0 { println!("跳过已存在地址 {} 个", skipped_addrs); }
