@@ -39,26 +39,24 @@ enum Commands {
         #[arg(long)]
         output_dir: Option<String>,
     },
-    /// 从已拉取的块数据构建地址过滤器（BinaryFuse16）
+    /// 从所有 fetcher 目录的块数据构建地址过滤器，输出到 data/filter/
     BuildFilter {
-        #[arg(long, default_value = "eth")]
-        chain: String,
+        /// 只处理指定批次（逗号分隔），省略则处理全部
         #[arg(long, num_args(0..), value_delimiter(','))]
         batch: Option<Vec<u64>>,
-        /// 指定 data 目录（默认用 config 的 data_dir），ranges=data/fetcher_<chain>/ranges，BF 输出到 data/fetcher_<chain>
-        #[arg(long)]
-        data_dir: Option<String>,
+        /// 手动指定 source ranges 目录（覆盖自动扫描）
         #[arg(long)]
         source: Option<String>,
+        /// 手动指定 BF 输出目录（默认 data/filter/）
         #[arg(long)]
         output: Option<String>,
     },
     /// 查询地址是否在 BF 过滤器中
+    /// 查询地址是否在 BF 过滤器中
     FilterQuery {
-        #[arg(long, default_value = "eth")]
-        chain: String,
         #[arg(required = true)]
         address: String,
+        /// 手动指定 BF 文件或目录（默认 data/filter/）
         #[arg(long)]
         filter: Option<String>,
     },
@@ -71,9 +69,6 @@ enum Commands {
     },
     /// 碰撞器：N 线程生成地址，实时与 BF 碰撞，命中写 CSV，支持断点续碰
     Collide {
-        /// 链标识（默认 eth），决定从哪个 BF 目录加载
-        #[arg(long, default_value = "eth")]
-        chain: String,
         /// worker 线程数（默认 4，--gpu 时为 CPU PBKDF2 线程数）
         #[arg(long, default_value = "4")]
         threads: usize,
@@ -99,10 +94,10 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(cfg),
         Commands::Fetch { chain, batch, rpc, output_dir } => cmd_fetch(cfg, &chain, batch.as_deref(), rpc, output_dir, &cli.config),
-        Commands::BuildFilter { chain, batch, data_dir, source, output } => cmd_build_filter(cfg, &chain, batch.as_deref(), data_dir.as_deref(), source.as_deref(), output.as_deref()),
-        Commands::FilterQuery { chain, address, filter } => cmd_filter_query(cfg, &chain, &address, filter.as_deref()),
+        Commands::BuildFilter { batch, source, output } => cmd_build_filter(cfg, batch.as_deref(), source.as_deref(), output.as_deref()),
+        Commands::FilterQuery { address, filter } => cmd_filter_query(cfg, &address, filter.as_deref()),
         Commands::FetchTest { rpc, block } => cmd_fetch_test(cfg, rpc, block),
-        Commands::Collide { chain, threads, gpu } => cmd_collide(cfg, &chain, threads, gpu),
+        Commands::Collide { threads, gpu } => cmd_collide(cfg, threads, gpu),
         Commands::IdInfo { id, all } => cmd_id_info(cfg, id, all),
     }
 }
@@ -220,98 +215,96 @@ fn cmd_fetch(
 
 fn cmd_build_filter(
     cfg: config::AppConfig,
-    chain: &str,
     batch: Option<&[u64]>,
-    data_dir: Option<&str>,
     source: Option<&str>,
     output: Option<&str>,
 ) -> Result<()> {
     use crate::filter;
-    let chain_suffix = format!("fetcher_{}", chain);
-    let (range_root, out_dir) = if let Some(d) = data_dir {
-        let base = std::path::PathBuf::from(d);
-        (base.join(&chain_suffix).join("ranges"), base.join(&chain_suffix))
-    } else {
-        (
-            source.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_ranges_dir_for(chain)),
-            output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.fetcher_dir_for(chain)),
-        )
-    };
+    cfg.ensure_dirs()?;
+    let out_dir = output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.filter_dir());
     std::fs::create_dir_all(&out_dir)?;
 
-    // 读取 meta，确认「当前正在写入」的批次，不合并该批次的 chunk
-    let meta = fetcher::load_meta(&range_root).unwrap_or_default();
-    let current_batch = meta.current_batch;
-    let current_batch_through = meta.current_batch_fetched_through_block;
-    let current_batch_seg_end = current_batch * fetcher::SEGMENT_SIZE - 1;
-    // 当前批次未写满时不合并其 chunk
-    let current_batch_done = current_batch_through >= current_batch_seg_end;
-
-    // 确定要处理的批次列表
-    let all_batches = fetcher::list_batches_in_ranges(&range_root)?;
-    anyhow::ensure!(
-        !all_batches.is_empty(),
-        "no batches found under {}",
-        range_root.display()
-    );
-    let batch_list: Vec<u64> = match batch {
-        Some(ids) if !ids.is_empty() => {
-            for &id in ids {
-                anyhow::ensure!(
-                    all_batches.contains(&id),
-                    "batch {} not found in ranges",
-                    id
-                );
-            }
-            ids.to_vec()
-        }
-        _ => all_batches.clone(),
+    // 收集所有 ranges 目录（支持 data/fetcher/ranges、data/fetcher_eth/ranges、data/fetcher_bnb/ranges ...）
+    let range_roots: Vec<std::path::PathBuf> = if let Some(s) = source {
+        vec![std::path::PathBuf::from(s)]
+    } else {
+        cfg.all_fetcher_ranges_dirs()
     };
+    anyhow::ensure!(!range_roots.is_empty(), "未找到任何 fetcher 的 ranges 目录，请先 birdhash fetch");
+    println!("  扫描 {} 个 fetcher ranges 目录:", range_roots.len());
+    for r in &range_roots { println!("    {}", r.display()); }
 
-    // 加载已有 BF，用于增量去重
-    let existing_bf = collider::load_all_bf_pub(&out_dir).unwrap_or_default();
+    // 加载已有 BF（data/filter/ + 旧 data/fetcher/ 兼容），用于增量去重
+    let mut existing_bf = collider::load_all_bf_pub(&out_dir).unwrap_or_default();
+    // 兼容旧 data/fetcher 下的 BF
+    let legacy_fetcher = cfg.data_dir.join("fetcher");
+    if legacy_fetcher.exists() && legacy_fetcher != out_dir {
+        existing_bf.extend(collider::load_all_bf_pub(&legacy_fetcher).unwrap_or_default());
+    }
     let has_existing = !existing_bf.is_empty();
-    if has_existing { println!("已加载 {} 组已有 BF，增量构建：跳过已存在地址", existing_bf.len()); }
+    if has_existing { println!("  已加载 {} 组已有 BF，增量构建：跳过已存在地址", existing_bf.len()); }
+
     let mut set1 = std::collections::HashSet::<u64>::new();
     let mut set2 = std::collections::HashSet::<u64>::new();
     let mut set3 = std::collections::HashSet::<u64>::new();
     let mut skipped_addrs = 0u64;
     let mut included_batches: Vec<u64> = Vec::new();
-    for &bid in &batch_list {
-        let is_current_writing = bid == current_batch && !current_batch_done;
-        if is_current_writing {
-            println!("  batch={} 跳过（当前写入中，through={}/{}）", bid, current_batch_through, current_batch_seg_end);
-            continue;
-        }
-        let seg_s = (bid.saturating_sub(1)) * fetcher::SEGMENT_SIZE;
-        let range_dir = range_root.join(fetcher::seg_dir_name(seg_s));
-        // 兼容 parquet + jsonl 两种格式
-        let addrs = fetcher::read_addresses_from_range_dir(&range_dir)?;
-        if addrs.is_empty() { continue; }
-        for addr in &addrs {
-            if has_existing && collider::contains_bf_pub(&existing_bf, addr) {
-                skipped_addrs += 1;
+
+    for range_root in &range_roots {
+        let meta = fetcher::load_meta(range_root).unwrap_or_default();
+        let current_batch = meta.current_batch;
+        let current_batch_through = meta.current_batch_fetched_through_block;
+        let current_batch_seg_end = current_batch * fetcher::SEGMENT_SIZE - 1;
+        let current_batch_done = current_batch_through >= current_batch_seg_end;
+
+        let all_batches = match fetcher::list_batches_in_ranges(range_root) {
+            Ok(b) if !b.is_empty() => b,
+            _ => { println!("  {} 无可用批次，跳过", range_root.display()); continue; }
+        };
+        let batch_list: Vec<u64> = match batch {
+            Some(ids) if !ids.is_empty() => ids.iter().copied().filter(|id| all_batches.contains(id)).collect(),
+            _ => all_batches.clone(),
+        };
+        if batch_list.is_empty() { continue; }
+        println!("  {} 发现 {} 个批次", range_root.display(), batch_list.len());
+
+        for &bid in &batch_list {
+            if bid == current_batch && !current_batch_done {
+                println!("    batch={} 跳过（写入中 through={}/{}）", bid, current_batch_through, current_batch_seg_end);
                 continue;
             }
-            set1.insert(filter::addr_to_u64(addr));
-            set2.insert(filter::addr_to_u64_alt(addr));
-            set3.insert(filter::addr_to_u64_alt2(addr));
+            let seg_s = (bid.saturating_sub(1)) * fetcher::SEGMENT_SIZE;
+            let range_dir = range_root.join(fetcher::seg_dir_name(seg_s));
+            let addrs = fetcher::read_addresses_from_range_dir(&range_dir)?;
+            if addrs.is_empty() { continue; }
+            let mut batch_new = 0u64;
+            for addr in &addrs {
+                if has_existing && collider::contains_bf_pub(&existing_bf, addr) {
+                    skipped_addrs += 1;
+                    continue;
+                }
+                set1.insert(filter::addr_to_u64(addr));
+                set2.insert(filter::addr_to_u64_alt(addr));
+                set3.insert(filter::addr_to_u64_alt2(addr));
+                batch_new += 1;
+            }
+            println!("    batch={} 读取 {} 个地址（新增 {}）", bid, addrs.len(), batch_new);
+            included_batches.push(bid);
         }
-        println!("  batch={} 读取 {} 个地址", bid, addrs.len());
-        included_batches.push(bid);
     }
-    if skipped_addrs > 0 { println!("跳过已存在地址 {} 个", skipped_addrs); }
-    anyhow::ensure!(
-        !included_batches.is_empty(),
-        "没有可用于生成 BF 的批次（当前批次可能仍在写入中）"
-    );
+
+    if skipped_addrs > 0 { println!("  跳过已存在地址 {} 个", skipped_addrs); }
+    if included_batches.is_empty() {
+        println!("  没有新批次需要构建 BF");
+        return Ok(());
+    }
 
     let keys1: Vec<u64> = set1.into_iter().collect();
     let keys2: Vec<u64> = set2.into_iter().collect();
     let keys3: Vec<u64> = set3.into_iter().collect();
     let entries = keys1.len();
     if entries == 0 {
-        println!("BuildFilter: batches={:?} 所有地址已存在于已有 BF 中，无需生成新过滤器", included_batches);
+        println!("  所有地址已存在于已有 BF 中，无需生成新过滤器");
         return Ok(());
     }
     let min_b = *included_batches.iter().min().unwrap();
@@ -322,6 +315,12 @@ fn cmd_build_filter(
     let out_path = out_dir.join(format!("{}.bin", base_name));
     let out_alt = out_dir.join(format!("{}.alt.bin", base_name));
     let out_alt2 = out_dir.join(format!("{}.alt2.bin", base_name));
+    // 已有同名 BF 则跳过
+    if out_path.exists() {
+        println!("  {} 已存在，跳过", out_path.display());
+        return Ok(());
+    }
+    println!("  构建 BF: {} 个唯一指纹 ...", entries);
     let f1 = filter::build_fuse16(&keys1)?;
     let f2 = filter::build_fuse16(&keys2)?;
     let f3 = filter::build_fuse16(&keys3)?;
@@ -329,39 +328,52 @@ fn cmd_build_filter(
     filter::save_fuse16(&f2, &out_alt)?;
     filter::save_fuse16(&f3, &out_alt2)?;
     fetcher::save_fetch_filter_meta(&out_path, &included_batches, max_b * fetcher::SEGMENT_SIZE)?;
-    println!("BuildFilter done: batches={:?} new_entries={} skipped={} -> {}", included_batches, entries, skipped_addrs, out_path.display());
+    println!("  BuildFilter done: batches={:?} entries={} skipped={} -> {}", included_batches, entries, skipped_addrs, out_path.display());
     Ok(())
 }
 
 fn cmd_filter_query(
     cfg: config::AppConfig,
-    chain: &str,
     address: &str,
     filter_path: Option<&str>,
 ) -> Result<()> {
     let addr = fetcher::parse_hex_addr(address.trim())
         .ok_or_else(|| anyhow::anyhow!("无效地址: {}", address))?;
+    let resolve_dir = || -> Result<std::path::PathBuf> {
+        let filter_dir = cfg.filter_dir();
+        if filter_dir.exists() && collider::bf_count_in_dir(&filter_dir) > 0 { return Ok(filter_dir); }
+        let legacy = cfg.data_dir.join("fetcher");
+        if legacy.exists() && collider::bf_count_in_dir(&legacy) > 0 {
+            println!("  data/filter 无 BF，回退到 {}", legacy.display());
+            return Ok(legacy);
+        }
+        anyhow::bail!("未找到 BF 过滤器，已检查:\n  - {}\n  - {}", filter_dir.display(), legacy.display());
+    };
     let hit = match filter_path {
         None => {
-            let dir = cfg.fetcher_dir_for(chain);
-            if !dir.exists() {
-                anyhow::bail!("fetcher_{} 目录不存在: {}", chain, dir.display());
-            }
-            collider::bf_contains(&dir, &addr)?
+            let dir = resolve_dir()?;
+            println!("  加载 BF 过滤器: {}", dir.display());
+            let (hit, count) = collider::bf_contains_verbose(&dir, &addr)?;
+            println!("  已加载 {} 组 BF 过滤器", count);
+            hit
         }
         Some(s) => {
             let p = std::path::Path::new(s);
-            if !p.exists() {
-                anyhow::bail!("路径不存在: {}", p.display());
-            }
+            if !p.exists() { anyhow::bail!("路径不存在: {}", p.display()); }
             if p.is_dir() {
-                collider::bf_contains(p, &addr)?
+                println!("  加载 BF 过滤器: {}", p.display());
+                let (hit, count) = collider::bf_contains_verbose(p, &addr)?;
+                println!("  已加载 {} 组 BF 过滤器", count);
+                hit
             } else {
+                println!("  加载单个 BF: {}", p.display());
                 let f = filter::load_fuse16(p)?;
                 f.contains(&filter::addr_to_u64(&addr))
             }
         }
     };
+    println!("  查询地址: {}", address.trim());
+    println!("  结果: {}", if hit { "命中" } else { "未命中" });
     println!("{}", if hit { 1 } else { 0 });
     Ok(())
 }
@@ -488,12 +500,12 @@ fn resolve_rpc_urls(cfg: &config::AppConfig, rpc_cli: Option<String>) -> Result<
     Ok(urls)
 }
 
-fn cmd_collide(cfg: config::AppConfig, chain: &str, threads: usize, gpu: bool) -> Result<()> {
+fn cmd_collide(cfg: config::AppConfig, threads: usize, gpu: bool) -> Result<()> {
     if gpu {
-        log::info!("使用 GPU 模式 chain={} CPU PBKDF2 线程={}", chain, threads);
-        gpu_collider::run_gpu_collider(&cfg, chain, threads)
+        log::info!("使用 GPU 模式，CPU PBKDF2 线程={}", threads);
+        gpu_collider::run_gpu_collider(&cfg, threads)
     } else {
-        collider::run_collider(&cfg, chain, threads)
+        collider::run_collider(&cfg, threads)
     }
 }
 

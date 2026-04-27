@@ -26,8 +26,8 @@ cargo build --release
 |------|------|
 | `init` | 创建 data/assets 目录并生成 generator 种子 |
 | `fetch` | 按批次拉取区块（指定批次或持续拉取最新批） |
-| `build-filter` | 合并 ranges 下小文件并生成 BF 过滤器到 data/fetcher |
-| `filter-query` | 查询地址是否在 BF 中 |
+| `build-filter` | 扫描所有 fetcher 目录的原始数据，生成 BF 过滤器到 data/filter/ |
+| `filter-query` | 查询地址是否在 BF 中（从 data/filter/ 加载） |
 | `fetch-test` | 拉取单块并打印块信息与提取的地址 |
 | `collide` | 碰撞器：多线程生成地址与 BF 碰撞，命中写 CSV |
 | `id-info` | 查询某 ID 的助记词/地址/私钥，或导出派生 CSV |
@@ -65,33 +65,29 @@ birdhash fetch --batch 247 --output-dir /path/to/ranges --rpc https://eth.llamar
 
 ### build-filter
 
-扫描 `data/fetcher/ranges`（或 `--data-dir`/`--source` 指定目录），合并各批次小文件为 `blocks.jsonl`，再根据「当前仍有 range 数据的批次」生成 BF，输出到 `data/fetcher`（或 `--output`）。会读取 fetcher 的 meta，不合并、不包含「当前正在写入」的批次。**仅会写入本次涉及批次的 BF 文件，不会删除目录下已有的其他 `filter.*.bin`**（例如已把 BF 放到 data、删掉部分 range 以省空间后，再跑 build-filter 只会为仍存在 range 的批次生成/覆盖对应 BF，不会动其它已建好的 BF）。
+自动扫描 `data/` 下所有 `fetcher*` 目录（`data/fetcher/`、`data/fetcher_eth/`、`data/fetcher_bnb/` ...）的 ranges 数据，增量构建 BF 过滤器，输出到统一目录 `data/filter/`。已有 BF 中已存在的地址自动跳过，已有同名 BF 文件不会重复构建。
 
 ```bash
-# 使用默认 data 目录，处理所有可合并批次并生成 BF
+# 自动扫描所有 fetcher 目录，增量构建
 birdhash build-filter
 
-# 指定 data 目录（ranges = <data_dir>/fetcher/ranges，输出 = <data_dir>/fetcher）
-birdhash build-filter --data-dir /path/to/data
-
-# 仅对指定批次生成 BF
+# 仅处理指定批次
 birdhash build-filter --batch 246,247
 
-# 自定义数据源与输出目录
-birdhash build-filter --source /path/to/ranges --output /path/to/fetcher
+# 手动指定 source 和 output
+birdhash build-filter --source /path/to/ranges --output /path/to/filter
 ```
 
 ### filter-query
 
-查询单个地址是否命中 BF，输出 `1` 或 `0`。未指定 `--filter` 时从 config 的 `data_dir/fetcher` 加载所有 `filter.*.bin`。
+查询单个地址是否命中 BF，输出 `1`（命中）或 `0`。默认从 `data/filter/` 加载，如为空自动回退到 `data/fetcher/`。
 
 ```bash
-# 使用默认 data/fetcher 下的 BF
 birdhash filter-query 0xdadb0d80178819f2319190d340ce9a924f783711
 
 # 指定 BF 目录或单个 .bin 文件
-birdhash filter-query 0xafc8bc72c756ddc1957b276f5fbcb989dad93730 --filter data/fetcher
-birdhash filter-query 0x0000000000000000000000000000000000000001 --filter data/fetcher/filter.247-247.bin
+birdhash filter-query 0xafc8bc72c756ddc1957b276f5fbcb989dad93730 --filter data/filter
+birdhash filter-query 0x0000000000000000000000000000000000000001 --filter data/filter/filter.1-130.bin
 ```
 
 ### fetch-test
@@ -142,10 +138,10 @@ birdhash id-info 12345 --all
 
 ## 目录约定
 
-- `data/`：数据根目录（可由 config 或 `--data-dir` 覆盖）
-  - `data/fetcher/`：meta.json、BF 文件（filter.*.bin）
-  - `data/fetcher/ranges/<start>-<end>/`：各批次块数据（chunk_*.jsonl 或 blocks.jsonl）
-  - `data/results/`：碰撞结果、检查点
+- `data/`：数据根目录（可由 config 覆盖）
+  - `data/fetcher/`、`data/fetcher_eth/`、`data/fetcher_bnb/` ...：各链原始块数据（ranges/）
+  - `data/filter/`：所有 BF 过滤器（filter.*.bin），build-filter 统一输出到此
+  - `data/results/`：碰撞结果（hits_bf.csv）、检查点（collider_cursor.json）
 - `assets/`：种子、派生候选等
 
 详见 [COLLIDER.md](COLLIDER.md) 了解碰撞器流程与 BF 热更新。

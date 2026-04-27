@@ -157,10 +157,34 @@ pub(crate) fn contains_bf(triples: &[BfTriple], addr: &[u8; ADDR_LEN]) -> bool {
     })
 }
 
-/// 供 CLI filter-query 与碰撞器：从 fetcher_dir 加载所有 BF（含 .alt/.alt2 三指纹），判断地址是否命中
-pub fn bf_contains(fetcher_dir: &Path, addr: &[u8; ADDR_LEN]) -> Result<bool> {
+/// 解析 BF 所在目录：优先 data/filter/，回退到 data/fetcher/
+pub fn resolve_bf_dir(cfg: &AppConfig) -> Result<PathBuf> {
+    let filter_dir = cfg.filter_dir();
+    if filter_dir.exists() && bf_count_in_dir(&filter_dir) > 0 {
+        println!("  BF 目录: {} ({} 组)", filter_dir.display(), bf_count_in_dir(&filter_dir));
+        return Ok(filter_dir);
+    }
+    let legacy = cfg.data_dir.join("fetcher");
+    if legacy.exists() && bf_count_in_dir(&legacy) > 0 {
+        println!("  data/filter 无 BF，回退到 {} ({} 组)", legacy.display(), bf_count_in_dir(&legacy));
+        return Ok(legacy);
+    }
+    anyhow::bail!("未找到 BF 过滤器，请先 fetch + build-filter\n  已检查: {}, {}", filter_dir.display(), legacy.display())
+}
+
+/// 快速统计目录下 BF 主文件数量（不加载）
+pub fn bf_count_in_dir(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map(|rd| rd.filter_map(|e| {
+        let n = e.ok()?.file_name().to_string_lossy().to_string();
+        (n.starts_with("filter.") && n.ends_with(".bin") && !n.contains(".alt") && n.contains('-')).then_some(())
+    }).count()).unwrap_or(0)
+}
+
+/// 同 bf_contains，额外返回加载的 BF 组数
+pub fn bf_contains_verbose(fetcher_dir: &Path, addr: &[u8; ADDR_LEN]) -> Result<(bool, usize)> {
     let triples = load_all_bf(fetcher_dir)?;
-    Ok(!triples.is_empty() && contains_bf(&triples, addr))
+    let count = triples.len();
+    Ok((!triples.is_empty() && contains_bf(&triples, addr), count))
 }
 
 // ── 派生候选 ──
@@ -296,23 +320,20 @@ pub(crate) fn append_hit(
 
 // ── 主入口 ──
 
-pub fn run_collider(cfg: &AppConfig, chain: &str, num_threads: usize) -> Result<()> {
-    cfg.ensure_chain_dirs(chain)?;
+pub fn run_collider(cfg: &AppConfig, num_threads: usize) -> Result<()> {
+    cfg.ensure_dirs()?;
     let seed_key = load_or_create_seed(&cfg.generator_seed_path())?;
     let candidates = load_derivation_candidates(&cfg.derivation_candidates_path())?;
     let candidates = Arc::new(candidates);
     let paths_per = paths_per_id(&candidates);
-    let checkpoint_path = cfg.collider_cursor_path_for(chain);
-    let hits_csv = cfg.hits_bf_csv_path_for(chain);
-    let fetcher_dir = cfg.fetcher_dir_for(chain);
+    let checkpoint_path = cfg.collider_cursor_path();
+    let hits_csv = cfg.hits_bf_csv_path();
+    let filter_dir = resolve_bf_dir(cfg)?;
     ensure_hits_csv(&hits_csv)?;
 
-    let bf_filters = load_all_bf(&fetcher_dir)?;
+    let bf_filters = load_all_bf(&filter_dir)?;
     let bf_count = bf_filters.len();
-    anyhow::ensure!(
-        !bf_filters.is_empty(),
-        "未找到 BF 过滤器，请先运行 birdhash fetch + build-filter"
-    );
+    anyhow::ensure!(!bf_filters.is_empty(), "未找到 BF 过滤器，请先 fetch + build-filter");
     let bf = Arc::new(RwLock::new(bf_filters));
 
     let start_n = load_checkpoint(&checkpoint_path);
@@ -337,7 +358,7 @@ pub fn run_collider(cfg: &AppConfig, chain: &str, num_threads: usize) -> Result<
 
     // BF 热更新线程
     let bf_reload = Arc::clone(&bf);
-    let fetcher_dir_reload = fetcher_dir.clone();
+    let fetcher_dir_reload = filter_dir.clone();
     thread::spawn(move || loop {
         thread::sleep(std::time::Duration::from_secs(BF_RELOAD_INTERVAL_SECS));
         match load_all_bf(&fetcher_dir_reload) {
