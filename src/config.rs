@@ -58,19 +58,24 @@ impl AppConfig {
     pub fn collider_cursor_path(&self) -> PathBuf { self.results_dir().join("collider_cursor.json") }
     pub fn hits_bf_csv_path(&self) -> PathBuf { self.results_dir().join("hits_bf.csv") }
 
-    // 带 chain 标识的 fetcher 路径（fetch 命令使用，每条链单独存放原始数据）
+    // 带 chain 标识的 fetcher 路径
     pub fn fetcher_dir_for(&self, chain: &str) -> PathBuf { self.data_dir.join(format!("fetcher_{}", chain)) }
     pub fn fetcher_ranges_dir_for(&self, chain: &str) -> PathBuf { self.fetcher_dir_for(chain).join("ranges") }
+    pub fn fetcher_address_dir_for(&self, chain: &str) -> PathBuf { self.fetcher_dir_for(chain).join("address") }
 
-    /// 列出 data 目录下所有 fetcher* 目录（含旧版 data/fetcher 和新版 data/fetcher_eth 等）
-    pub fn all_fetcher_ranges_dirs(&self) -> Vec<PathBuf> {
+    /// 列出 data 下所有 fetcher*/ranges 目录
+    pub fn all_fetcher_ranges_dirs(&self) -> Vec<PathBuf> { self.collect_fetcher_subdirs("ranges") }
+    /// 列出 data 下所有 fetcher*/address 目录
+    pub fn all_fetcher_address_dirs(&self) -> Vec<PathBuf> { self.collect_fetcher_subdirs("address") }
+
+    fn collect_fetcher_subdirs(&self, sub: &str) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
                 if name.starts_with("fetcher") && e.path().is_dir() {
-                    let ranges = e.path().join("ranges");
-                    if ranges.is_dir() { dirs.push(ranges); }
+                    let d = e.path().join(sub);
+                    if d.is_dir() { dirs.push(d); }
                 }
             }
         }
@@ -90,6 +95,7 @@ impl AppConfig {
         self.ensure_dirs()?;
         std::fs::create_dir_all(self.fetcher_dir_for(chain))?;
         std::fs::create_dir_all(self.fetcher_ranges_dir_for(chain))?;
+        std::fs::create_dir_all(self.fetcher_address_dir_for(chain))?;
         Ok(())
     }
 

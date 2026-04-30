@@ -660,6 +660,193 @@ pub fn read_chunk_parquet(path: &Path) -> Result<(Vec<u64>, Vec<String>)> {
     Ok((bns, jsons))
 }
 
+// ── 地址模式 parquet（schema: block_number u64, address FixedSizeBinary(20)）──
+
+pub fn write_addr_parquet(path: &Path, block_numbers: &[u64], addresses: &[[u8; ADDR_LEN]]) -> Result<()> {
+    use arrow::array::{FixedSizeBinaryBuilder, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("block_number", DataType::UInt64, false),
+        Field::new("address", DataType::FixedSizeBinary(20), false),
+    ]));
+    let bn_arr = Arc::new(UInt64Array::from(block_numbers.to_vec()));
+    let mut ab = FixedSizeBinaryBuilder::with_capacity(addresses.len(), ADDR_LEN as i32);
+    for a in addresses { ab.append_value(a).context("append addr")?; }
+    let addr_arr = Arc::new(ab.finish());
+    let batch = RecordBatch::try_new(schema.clone(), vec![bn_arr, addr_arr])?;
+    let tmp = unique_tmp_path(path);
+    let file = std::fs::File::create(&tmp)?;
+    let mut w = ArrowWriter::try_new(file, schema, None)?;
+    w.write(&batch)?;
+    w.close()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+pub fn read_addr_parquet(path: &Path) -> Result<Vec<Address>> {
+    use arrow::array::{Array, FixedSizeBinaryArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut addrs = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let col = batch.column(1).as_any().downcast_ref::<FixedSizeBinaryArray>().context("cast addr")?;
+        for i in 0..col.len() {
+            let mut a = [0u8; ADDR_LEN];
+            a.copy_from_slice(col.value(i));
+            addrs.push(a);
+        }
+    }
+    Ok(addrs)
+}
+
+/// 从 address 目录的 segment 子目录读取地址（只有 addr parquet）
+pub fn read_addresses_from_addr_dir(seg_dir: &Path) -> Result<Vec<Address>> {
+    let mut addresses = Vec::new();
+    for i in 0..CHUNK_COUNT {
+        let p = seg_dir.join(format!("chunk_{:03}.parquet", i));
+        if p.exists() { addresses.extend(read_addr_parquet(&p)?); }
+    }
+    Ok(addresses)
+}
+
+/// 地址模式的 segment 处理：拉取块 → 提取地址 → 写 addr parquet
+pub fn run_fetch_range_addr_only(
+    output_root: &Path, start_block: u64, end_block: u64,
+    rpc_urls: &[String], timeout_secs: u64, batch_size: usize,
+    output_prefix: Option<&str>, progress_tx: FetchProgressSender, poll_mode: bool,
+) -> Result<()> {
+    let p = output_prefix.unwrap_or("");
+    anyhow::ensure!(!rpc_urls.is_empty(), "no RPC URLs");
+    anyhow::ensure!(start_block <= end_block, "start_block > end_block");
+    std::fs::create_dir_all(output_root)?;
+    let mut pool = RpcPool::new(rpc_urls.to_vec(), timeout_secs);
+    let latest = pool.get_latest_block_number()?;
+    let end_block = end_block.min(latest);
+    let batch_id = batch_id_for_block(end_block);
+    let first_seg = seg_start(start_block);
+    let last_seg = seg_start(end_block);
+    let mut seg = first_seg;
+    while seg <= last_seg {
+        let seg_end = (seg + SEGMENT_SIZE - 1).min(end_block);
+        let seg_start_b = if seg == first_seg { start_block } else { seg };
+        let (_, cp, _) = ensure_range_ready_for_segment(output_root, seg)?;
+        if cp.last_fetched_block >= seg_end {
+            log::info!("{}Segment {} done, skip.", p, seg_dir_name(seg));
+            seg = seg.saturating_add(SEGMENT_SIZE);
+            continue;
+        }
+        let resume_from = (cp.last_fetched_block + 1).max(seg_start_b);
+        println!("{}[addr] Segment {} resume {} (checkpoint {})", p, seg_dir_name(seg), resume_from, cp.last_fetched_block);
+        let (range_dir, _, _) = ensure_range_ready_for_segment(output_root, seg)?;
+        let is_single = first_seg == last_seg;
+        run_single_segment_addr_only(
+            range_dir, seg, resume_from, seg_end, &mut pool, batch_size, p,
+            if is_single { progress_tx.clone() } else { None },
+            poll_mode, batch_id, seg == last_seg,
+        )?;
+        seg = seg.saturating_add(SEGMENT_SIZE);
+    }
+    Ok(())
+}
+
+fn run_single_segment_addr_only(
+    range_dir: std::path::PathBuf, seg_s: u64,
+    start_block: u64, end_block: u64, pool: &mut RpcPool,
+    batch_size: usize, prefix: &str, progress_tx: FetchProgressSender,
+    poll_mode: bool, batch_id: u64, is_last: bool,
+) -> Result<()> {
+    let mut cp = FetchRangeCheckpoint {
+        start_block: seg_s, end_block: seg_s + SEGMENT_SIZE - 1,
+        last_fetched_block: start_block.saturating_sub(1),
+        status: "running".into(), updated_at: Utc::now(),
+    };
+    let ck_path = range_dir.join("checkpoint.json");
+    let start_chunk_idx = ((start_block.saturating_sub(seg_s)) / CHUNK_SIZE) as u32;
+    let mut cur_chunk = start_chunk_idx;
+    let mut buf_bns: Vec<u64> = Vec::new();
+    let mut buf_addrs: Vec<Address> = Vec::new();
+
+    // 恢复已有 chunk
+    let chunk_path = range_dir.join(format!("chunk_{:03}.parquet", cur_chunk));
+    if chunk_path.exists() {
+        if let Ok(addrs) = read_addr_parquet(&chunk_path) {
+            log::info!("{}resume addr chunk_{:03}.parquet ({} addrs)", prefix, cur_chunk, addrs.len());
+            buf_addrs = addrs;
+            buf_bns = vec![0u64; buf_addrs.len()]; // bn 仅做占位
+        }
+    }
+
+    let flush = |dir: &Path, idx: u32, bns: &[u64], addrs: &[[u8; ADDR_LEN]]| -> Result<()> {
+        if addrs.is_empty() { return Ok(()); }
+        write_addr_parquet(&dir.join(format!("chunk_{:03}.parquet", idx)), bns, addrs)
+    };
+
+    let batch_size = batch_size.max(1);
+    let start_time = std::time::Instant::now();
+    let mut next = start_block;
+    let mut total_written: u64 = 0;
+    let mut current_block: u64 = start_block.saturating_sub(1);
+
+    if let Some((bid, ref tx)) = progress_tx {
+        let _ = tx.send((bid, current_block, end_block, 0, 0.0));
+    }
+
+    while next <= end_block {
+        let count = ((end_block - next + 1) as usize).min(batch_size);
+        let blocks = pool.get_blocks_with_txs(next, count).with_context(|| format!("RPC block {}", next))?;
+        for (_bn, block_json) in &blocks {
+            let bn = block_json["number"].as_str()
+                .and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0);
+            if bn < start_block || bn <= cp.last_fetched_block { continue; }
+            let chunk_idx = ((bn - seg_s) / CHUNK_SIZE) as u32;
+            if chunk_idx != cur_chunk {
+                flush(&range_dir, cur_chunk, &buf_bns, &buf_addrs)?;
+                save_checkpoint_static(&ck_path, &cp)?;
+                buf_bns.clear(); buf_addrs.clear();
+                cur_chunk = chunk_idx;
+            }
+            for addr in extract_addresses_from_block(block_json) {
+                buf_bns.push(bn); buf_addrs.push(addr);
+            }
+            cp.last_fetched_block = bn; cp.updated_at = Utc::now();
+            total_written += 1; current_block = bn;
+            if total_written % CHECKPOINT_SAVE_INTERVAL == 0 {
+                flush(&range_dir, cur_chunk, &buf_bns, &buf_addrs)?;
+                save_checkpoint_static(&ck_path, &cp)?;
+            }
+        }
+        if blocks.is_empty() { break; }
+        next = blocks.last().map(|(b, _)| *b).unwrap_or(next).saturating_add(1);
+        let elapsed = start_time.elapsed().as_secs_f64().max(0.001);
+        let blk_s = total_written as f64 / elapsed;
+        if let Some((bid, ref tx)) = progress_tx {
+            let _ = tx.send((bid, current_block, end_block, total_written, blk_s));
+        } else if poll_mode {
+            print!("\r  batch={} height={} blocks={}   ", batch_id, current_block, total_written);
+            let _ = std::io::stdout().flush();
+        } else if is_last {
+            print!("{}\r  [addr] block={} | {}..{} written={} ({:.0} blk/s)   ", prefix, current_block, start_block, end_block, total_written, blk_s);
+            let _ = std::io::stdout().flush();
+        }
+    }
+    flush(&range_dir, cur_chunk, &buf_bns, &buf_addrs)?;
+    cp.status = "done".into(); cp.updated_at = Utc::now();
+    save_checkpoint_static(&ck_path, &cp)?;
+    if poll_mode {
+        print!("\r  batch={} height={} blocks={}   ", batch_id, end_block, total_written);
+        let _ = std::io::stdout().flush();
+    } else if progress_tx.is_none() && is_last {
+        println!("{}\nDone. {} blocks (addr parquet) in {:.1}s", prefix, total_written, start_time.elapsed().as_secs_f64());
+    }
+    Ok(())
+}
+
 /// 从 segment 目录读取所有地址（兼容 parquet + jsonl）
 pub fn read_addresses_from_range_dir(range_dir: &Path) -> Result<Vec<Address>> {
     let mut addresses = Vec::new();

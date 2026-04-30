@@ -29,9 +29,12 @@ enum Commands {
     Init,
     /// Fetch raw blocks by batch: 1=1..100000, 2=100001..200000, ... Omit = latest batch (with poll loop if poll_interval_secs>0).
     Fetch {
-        /// 链标识（默认 eth），影响落盘目录名：data/fetcher_<chain>/ranges/
+        /// 链标识（默认 eth），影响落盘目录名：data/fetcher_<chain>/
         #[arg(long, default_value = "eth")]
         chain: String,
+        /// 只保存块中提取的地址（写入 address/ 目录），不保存原始块 JSON
+        #[arg(long)]
+        addr_only: bool,
         #[arg(long, num_args(1..), value_delimiter(','))]
         batch: Option<Vec<u64>>,
         #[arg(short, long, alias = "rpc-url")]
@@ -93,7 +96,7 @@ fn main() -> Result<()> {
     let cfg = load_config(&cli);
     match cli.command {
         Commands::Init => cmd_init(cfg),
-        Commands::Fetch { chain, batch, rpc, output_dir } => cmd_fetch(cfg, &chain, batch.as_deref(), rpc, output_dir, &cli.config),
+        Commands::Fetch { chain, addr_only, batch, rpc, output_dir } => cmd_fetch(cfg, &chain, addr_only, batch.as_deref(), rpc, output_dir, &cli.config),
         Commands::BuildFilter { batch, source, output } => cmd_build_filter(cfg, batch.as_deref(), source.as_deref(), output.as_deref()),
         Commands::FilterQuery { address, filter } => cmd_filter_query(cfg, &address, filter.as_deref()),
         Commands::FetchTest { rpc, block } => cmd_fetch_test(cfg, rpc, block),
@@ -118,6 +121,7 @@ const SEGMENT_SIZE: u64 = 100_000;
 fn cmd_fetch(
     cfg: config::AppConfig,
     chain: &str,
+    addr_only: bool,
     batches: Option<&[u64]>,
     rpc_cli: Option<String>,
     output_dir: Option<String>,
@@ -125,10 +129,10 @@ fn cmd_fetch(
 ) -> Result<()> {
     let rpc_urls = resolve_rpc_urls(&cfg, rpc_cli.clone())?;
     cfg.ensure_chain_dirs(chain)?;
-    let out_root = output_dir
-        .clone()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| cfg.fetcher_ranges_dir_for(chain));
+    let out_root = output_dir.clone().map(std::path::PathBuf::from).unwrap_or_else(||
+        if addr_only { cfg.fetcher_address_dir_for(chain) } else { cfg.fetcher_ranges_dir_for(chain) }
+    );
+    if addr_only { println!("  [addr-only] 只保存地址到 {}", out_root.display()); }
     std::fs::create_dir_all(&out_root)?;
     let mut pool = fetcher::RpcPool::new(rpc_urls.clone(), cfg.rpc_timeout_secs);
     let latest = pool.get_latest_block_number()?;
@@ -170,43 +174,22 @@ fn cmd_fetch(
     );
     let start_block = (batch - 1) * SEGMENT_SIZE + 1;
     let mut end_block = (batch * SEGMENT_SIZE).min(latest);
-    fetcher::run_fetch_range(
-        &out_root,
-        start_block,
-        end_block,
-        &rpc_urls,
-        cfg.rpc_timeout_secs,
-        cfg.rpc_batch_size,
-        Some(&prefix),
-        None,
-        false,
-    )?;
+    let do_fetch = |root: &std::path::Path, s: u64, e: u64, pfx: Option<&str>, ptx: fetcher::FetchProgressSender, pm: bool| -> Result<()> {
+        if addr_only {
+            fetcher::run_fetch_range_addr_only(root, s, e, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, pfx, ptx, pm)
+        } else {
+            fetcher::run_fetch_range(root, s, e, &rpc_urls, cfg.rpc_timeout_secs, cfg.rpc_batch_size, pfx, ptx, pm)
+        }
+    };
+    do_fetch(&out_root, start_block, end_block, Some(&prefix), None, false)?;
     if batch == total_batches && cfg.poll_interval_secs > 0 {
         loop {
-            print!(
-                "\r  batch={} height={} blocks={} (polling every {}s)   ",
-                batch,
-                end_block,
-                end_block - (batch - 1) * SEGMENT_SIZE,
-                cfg.poll_interval_secs
-            );
+            print!("\r  batch={} height={} blocks={} (polling every {}s)   ", batch, end_block, end_block - (batch - 1) * SEGMENT_SIZE, cfg.poll_interval_secs);
             let _ = std::io::stdout().flush();
             std::thread::sleep(std::time::Duration::from_secs(cfg.poll_interval_secs));
             let new_latest = pool.get_latest_block_number()?;
-            if new_latest <= end_block {
-                continue;
-            }
-            fetcher::run_fetch_range(
-                &out_root,
-                end_block + 1,
-                new_latest,
-                &rpc_urls,
-                cfg.rpc_timeout_secs,
-                cfg.rpc_batch_size,
-                Some(&prefix),
-                None,
-                true,
-            )?;
+            if new_latest <= end_block { continue; }
+            do_fetch(&out_root, end_block + 1, new_latest, Some(&prefix), None, true)?;
             end_block = new_latest;
         }
     }
@@ -224,15 +207,22 @@ fn cmd_build_filter(
     let out_dir = output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.filter_dir());
     std::fs::create_dir_all(&out_dir)?;
 
-    // 收集所有 ranges 目录（支持 data/fetcher/ranges、data/fetcher_eth/ranges、data/fetcher_bnb/ranges ...）
+    // 收集 ranges + address 目录
     let range_roots: Vec<std::path::PathBuf> = if let Some(s) = source {
         vec![std::path::PathBuf::from(s)]
     } else {
         cfg.all_fetcher_ranges_dirs()
     };
-    anyhow::ensure!(!range_roots.is_empty(), "未找到任何 fetcher 的 ranges 目录，请先 birdhash fetch");
-    println!("  扫描 {} 个 fetcher ranges 目录:", range_roots.len());
-    for r in &range_roots { println!("    {}", r.display()); }
+    let addr_roots: Vec<std::path::PathBuf> = if source.is_some() { vec![] } else { cfg.all_fetcher_address_dirs() };
+    anyhow::ensure!(!range_roots.is_empty() || !addr_roots.is_empty(), "未找到任何 fetcher 的 ranges/address 目录，请先 birdhash fetch");
+    if !range_roots.is_empty() {
+        println!("  扫描 {} 个 ranges 目录:", range_roots.len());
+        for r in &range_roots { println!("    {}", r.display()); }
+    }
+    if !addr_roots.is_empty() {
+        println!("  扫描 {} 个 address 目录:", addr_roots.len());
+        for r in &addr_roots { println!("    {}", r.display()); }
+    }
 
     // 加载已有 BF（data/filter/ + 旧 data/fetcher/ 兼容），用于增量去重
     let mut existing_bf = collider::load_all_bf_pub(&out_dir).unwrap_or_default();
@@ -289,6 +279,45 @@ fn cmd_build_filter(
                 batch_new += 1;
             }
             println!("    batch={} 读取 {} 个地址（新增 {}）", bid, addrs.len(), batch_new);
+            included_batches.push(bid);
+        }
+    }
+
+    // 扫描 address 目录（已提前提取地址，直接读 addr parquet）
+    for addr_root in &addr_roots {
+        let meta = fetcher::load_meta(addr_root).unwrap_or_default();
+        let current_batch = meta.current_batch;
+        let current_batch_through = meta.current_batch_fetched_through_block;
+        let current_batch_seg_end = current_batch * fetcher::SEGMENT_SIZE - 1;
+        let current_batch_done = current_batch_through >= current_batch_seg_end;
+        let all_batches = match fetcher::list_batches_in_ranges(addr_root) {
+            Ok(b) if !b.is_empty() => b,
+            _ => { println!("  {} 无可用批次，跳过", addr_root.display()); continue; }
+        };
+        let batch_list: Vec<u64> = match batch {
+            Some(ids) if !ids.is_empty() => ids.iter().copied().filter(|id| all_batches.contains(id)).collect(),
+            _ => all_batches.clone(),
+        };
+        if batch_list.is_empty() { continue; }
+        println!("  {} 发现 {} 个批次 (addr)", addr_root.display(), batch_list.len());
+        for &bid in &batch_list {
+            if bid == current_batch && !current_batch_done {
+                println!("    batch={} 跳过（写入中）", bid);
+                continue;
+            }
+            let seg_s = (bid.saturating_sub(1)) * fetcher::SEGMENT_SIZE;
+            let seg_dir = addr_root.join(fetcher::seg_dir_name(seg_s));
+            let addrs = fetcher::read_addresses_from_addr_dir(&seg_dir)?;
+            if addrs.is_empty() { continue; }
+            let mut batch_new = 0u64;
+            for addr in &addrs {
+                if has_existing && collider::contains_bf_pub(&existing_bf, addr) { skipped_addrs += 1; continue; }
+                set1.insert(filter::addr_to_u64(addr));
+                set2.insert(filter::addr_to_u64_alt(addr));
+                set3.insert(filter::addr_to_u64_alt2(addr));
+                batch_new += 1;
+            }
+            println!("    batch={} 读取 {} 个地址（新增 {}）[addr]", bid, addrs.len(), batch_new);
             included_batches.push(bid);
         }
     }
