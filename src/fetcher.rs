@@ -687,29 +687,102 @@ pub fn write_addr_parquet(path: &Path, block_numbers: &[u64], addresses: &[[u8; 
 }
 
 pub fn read_addr_parquet(path: &Path) -> Result<Vec<Address>> {
-    use arrow::array::{Array, FixedSizeBinaryArray};
+    use arrow::array::{Array, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let mut addrs = Vec::new();
     for batch in reader {
         let batch = batch?;
-        let col = batch.column(1).as_any().downcast_ref::<FixedSizeBinaryArray>().context("cast addr")?;
-        for i in 0..col.len() {
-            let mut a = [0u8; ADDR_LEN];
-            a.copy_from_slice(col.value(i));
-            addrs.push(a);
+        let schema = batch.schema();
+        let addr_idx = schema
+            .fields()
+            .iter()
+            .position(|f| f.name() == "address")
+            .or_else(|| if batch.num_columns() > 1 { Some(1) } else if batch.num_columns() > 0 { Some(0) } else { None })
+            .ok_or_else(|| anyhow::anyhow!("addr parquet 无 address 列: {}", path.display()))?;
+        let col = batch.column(addr_idx);
+        if let Some(c) = col.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+            for i in 0..c.len() {
+                let v = c.value(i);
+                if v.len() != ADDR_LEN { continue; }
+                let mut a = [0u8; ADDR_LEN];
+                a.copy_from_slice(v);
+                addrs.push(a);
+            }
+            continue;
         }
+        if let Some(c) = col.as_any().downcast_ref::<BinaryArray>() {
+            for i in 0..c.len() {
+                let v = c.value(i);
+                if v.len() == ADDR_LEN {
+                    let mut a = [0u8; ADDR_LEN];
+                    a.copy_from_slice(v);
+                    addrs.push(a);
+                    continue;
+                }
+                if let Ok(s) = std::str::from_utf8(v) {
+                    if let Some(a) = parse_hex_addr(s) { addrs.push(a); }
+                }
+            }
+            continue;
+        }
+        if let Some(c) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+            for i in 0..c.len() {
+                let v = c.value(i);
+                if v.len() == ADDR_LEN {
+                    let mut a = [0u8; ADDR_LEN];
+                    a.copy_from_slice(v);
+                    addrs.push(a);
+                    continue;
+                }
+                if let Ok(s) = std::str::from_utf8(v) {
+                    if let Some(a) = parse_hex_addr(s) { addrs.push(a); }
+                }
+            }
+            continue;
+        }
+        if let Some(c) = col.as_any().downcast_ref::<StringArray>() {
+            for i in 0..c.len() {
+                if let Some(a) = parse_hex_addr(c.value(i)) { addrs.push(a); }
+            }
+            continue;
+        }
+        if let Some(c) = col.as_any().downcast_ref::<LargeStringArray>() {
+            for i in 0..c.len() {
+                if let Some(a) = parse_hex_addr(c.value(i)) { addrs.push(a); }
+            }
+            continue;
+        }
+        anyhow::bail!("cast addr: 不支持的 address 列类型 {:?} @ {}", col.data_type(), path.display());
     }
     Ok(addrs)
 }
 
-/// 从 address 目录的 segment 子目录读取地址（只有 addr parquet）
+/// 从 address 目录的 segment 子目录读取地址
+/// 兼容两种格式：addr parquet（address 列）或 block JSON parquet（block_json 列需提取）
 pub fn read_addresses_from_addr_dir(seg_dir: &Path) -> Result<Vec<Address>> {
     let mut addresses = Vec::new();
     for i in 0..CHUNK_COUNT {
         let p = seg_dir.join(format!("chunk_{:03}.parquet", i));
-        if p.exists() { addresses.extend(read_addr_parquet(&p)?); }
+        if !p.exists() { continue; }
+        // 先检测 schema 决定走哪条路径
+        let file = std::fs::File::open(&p).with_context(|| format!("open {}", p.display()))?;
+        let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let schema = builder.schema().clone();
+        let has_address_col = schema.fields().iter().any(|f| f.name() == "address");
+        let has_block_json = schema.fields().iter().any(|f| f.name() == "block_json");
+        drop(builder);
+        if has_address_col {
+            addresses.extend(read_addr_parquet(&p)?);
+        } else if has_block_json {
+            let (_, jsons) = read_chunk_parquet(&p)?;
+            for js in &jsons {
+                if let Ok(block) = serde_json::from_str::<serde_json::Value>(js) {
+                    addresses.extend(extract_addresses_from_block(&block));
+                }
+            }
+        }
     }
     Ok(addresses)
 }

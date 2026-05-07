@@ -265,20 +265,22 @@ fn cmd_build_filter(
             }
             let seg_s = (bid.saturating_sub(1)) * fetcher::SEGMENT_SIZE;
             let range_dir = range_root.join(fetcher::seg_dir_name(seg_s));
+            println!("    处理中 batch={} file={}", bid, range_dir.display());
             let addrs = fetcher::read_addresses_from_range_dir(&range_dir)?;
             if addrs.is_empty() { continue; }
+            let src_unique = addrs.iter().copied().collect::<std::collections::HashSet<[u8; 20]>>().len();
             let mut batch_new = 0u64;
             for addr in &addrs {
                 if has_existing && collider::contains_bf_pub(&existing_bf, addr) {
                     skipped_addrs += 1;
                     continue;
                 }
-                set1.insert(filter::addr_to_u64(addr));
+                let inserted = set1.insert(filter::addr_to_u64(addr));
                 set2.insert(filter::addr_to_u64_alt(addr));
                 set3.insert(filter::addr_to_u64_alt2(addr));
-                batch_new += 1;
+                if inserted { batch_new += 1; }
             }
-            println!("    batch={} 读取 {} 个地址（新增 {}）", bid, addrs.len(), batch_new);
+            println!("    file={} batch={} 原始={} 提取去重={} 新增去重={}", range_dir.display(), bid, addrs.len(), src_unique, batch_new);
             included_batches.push(bid);
         }
     }
@@ -307,17 +309,19 @@ fn cmd_build_filter(
             }
             let seg_s = (bid.saturating_sub(1)) * fetcher::SEGMENT_SIZE;
             let seg_dir = addr_root.join(fetcher::seg_dir_name(seg_s));
+            println!("    处理中 batch={} file={} [addr]", bid, seg_dir.display());
             let addrs = fetcher::read_addresses_from_addr_dir(&seg_dir)?;
             if addrs.is_empty() { continue; }
+            let src_unique = addrs.iter().copied().collect::<std::collections::HashSet<[u8; 20]>>().len();
             let mut batch_new = 0u64;
             for addr in &addrs {
                 if has_existing && collider::contains_bf_pub(&existing_bf, addr) { skipped_addrs += 1; continue; }
-                set1.insert(filter::addr_to_u64(addr));
+                let inserted = set1.insert(filter::addr_to_u64(addr));
                 set2.insert(filter::addr_to_u64_alt(addr));
                 set3.insert(filter::addr_to_u64_alt2(addr));
-                batch_new += 1;
+                if inserted { batch_new += 1; }
             }
-            println!("    batch={} 读取 {} 个地址（新增 {}）[addr]", bid, addrs.len(), batch_new);
+            println!("    file={} batch={} 原始={} 提取去重={} 新增去重={} [addr]", seg_dir.display(), bid, addrs.len(), src_unique, batch_new);
             included_batches.push(bid);
         }
     }
