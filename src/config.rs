@@ -12,6 +12,12 @@ pub struct AppConfig {
     pub rpc_batch_size: usize,
     pub rpc_timeout_secs: u64,
     pub poll_interval_secs: u64,
+    // BTC RPC
+    pub btc_rpc_url: Option<String>,
+    pub btc_rpc_user: Option<String>,
+    pub btc_rpc_password: Option<String>,
+    pub btc_rpc_batch_size: usize,
+    pub btc_rpc_timeout_secs: u64,
 }
 
 impl Default for AppConfig {
@@ -25,6 +31,11 @@ impl Default for AppConfig {
             rpc_batch_size: 10,
             rpc_timeout_secs: 30,
             poll_interval_secs: 12,
+            btc_rpc_url: None,
+            btc_rpc_user: None,
+            btc_rpc_password: None,
+            btc_rpc_batch_size: 1,
+            btc_rpc_timeout_secs: 60,
         }
     }
 }
@@ -33,6 +44,15 @@ impl Default for AppConfig {
 struct TomlConfig {
     general: Option<TomlGeneral>,
     fetcher: Option<TomlFetcher>,
+    btc_fetcher: Option<TomlBtcFetcher>,
+}
+#[derive(serde::Deserialize, Default)]
+struct TomlBtcFetcher {
+    rpc_url: Option<String>,
+    rpc_user: Option<String>,
+    rpc_password: Option<String>,
+    batch_size: Option<usize>,
+    timeout_secs: Option<u64>,
 }
 #[derive(serde::Deserialize, Default)]
 struct TomlGeneral {
@@ -99,6 +119,23 @@ impl AppConfig {
         Ok(())
     }
 
+    // BTC 专用路径
+    pub fn btc_fetcher_dir(&self) -> PathBuf { self.data_dir.join("fetcher_btc") }
+    pub fn btc_address_dir(&self) -> PathBuf { self.btc_fetcher_dir().join("btc_address") }
+    pub fn btc_filter_dir(&self) -> PathBuf { self.data_dir.join("filter_btc") }
+    pub fn btc_results_dir(&self) -> PathBuf { self.data_dir.join("results_btc") }
+    pub fn btc_collider_cursor_path(&self) -> PathBuf { self.btc_results_dir().join("btc_collider_cursor.json") }
+    pub fn btc_hits_csv_path(&self) -> PathBuf { self.btc_results_dir().join("hits_btc.csv") }
+
+    pub fn ensure_btc_dirs(&self) -> anyhow::Result<()> {
+        self.ensure_dirs()?;
+        std::fs::create_dir_all(self.btc_fetcher_dir())?;
+        std::fs::create_dir_all(self.btc_address_dir())?;
+        std::fs::create_dir_all(self.btc_filter_dir())?;
+        std::fs::create_dir_all(self.btc_results_dir())?;
+        Ok(())
+    }
+
     pub fn load(path: &Path) -> Self {
         let mut cfg = Self::default();
         let Ok(content) = std::fs::read_to_string(path) else {
@@ -148,6 +185,13 @@ impl AppConfig {
             if let Some(p) = f.poll_interval_secs {
                 cfg.poll_interval_secs = p;
             }
+        }
+        if let Some(b) = toml.btc_fetcher {
+            cfg.btc_rpc_url = b.rpc_url;
+            cfg.btc_rpc_user = b.rpc_user;
+            cfg.btc_rpc_password = b.rpc_password;
+            if let Some(bs) = b.batch_size { if bs > 0 { cfg.btc_rpc_batch_size = bs; } }
+            if let Some(t) = b.timeout_secs { if t > 0 { cfg.btc_rpc_timeout_secs = t; } }
         }
         cfg
     }

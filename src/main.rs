@@ -1,5 +1,8 @@
+mod btc_collider;
+mod btc_fetcher;
 mod collider;
 mod config;
+mod dedup_bloom;
 mod derivation;
 mod fetcher;
 mod filter;
@@ -41,6 +44,9 @@ enum Commands {
         rpc: Option<String>,
         #[arg(long)]
         output_dir: Option<String>,
+        /// 使用 BTC 模式
+        #[arg(short = 'B', long)]
+        btc: bool,
     },
     /// 从所有 fetcher 目录的块数据构建地址过滤器，输出到 data/filter/
     BuildFilter {
@@ -53,8 +59,10 @@ enum Commands {
         /// 手动指定 BF 输出目录（默认 data/filter/）
         #[arg(long)]
         output: Option<String>,
+        /// 使用 BTC 模式
+        #[arg(short = 'B', long)]
+        btc: bool,
     },
-    /// 查询地址是否在 BF 过滤器中
     /// 查询地址是否在 BF 过滤器中
     FilterQuery {
         #[arg(required = true)]
@@ -62,6 +70,9 @@ enum Commands {
         /// 手动指定 BF 文件或目录（默认 data/filter/）
         #[arg(long)]
         filter: Option<String>,
+        /// 使用 BTC 模式
+        #[arg(short = 'B', long)]
+        btc: bool,
     },
     /// Fetch one block and print block info
     FetchTest {
@@ -78,6 +89,9 @@ enum Commands {
         /// 使用 NVIDIA GPU（CUDA）加速派生，需要已安装 N 卡驱动
         #[arg(long)]
         gpu: bool,
+        /// 使用 BTC 模式
+        #[arg(short = 'B', long)]
+        btc: bool,
     },
     /// 查询 ID 的助记词/地址/私钥信息，或导出全部派生 CSV
     IdInfo {
@@ -87,6 +101,9 @@ enum Commands {
         /// 导出全部 (account×index) 派生为 CSV
         #[arg(long)]
         all: bool,
+        /// 使用 BTC 模式
+        #[arg(short = 'B', long)]
+        btc: bool,
     },
 }
 
@@ -96,12 +113,27 @@ fn main() -> Result<()> {
     let cfg = load_config(&cli);
     match cli.command {
         Commands::Init => cmd_init(cfg),
-        Commands::Fetch { chain, addr_only, batch, rpc, output_dir } => cmd_fetch(cfg, &chain, addr_only, batch.as_deref(), rpc, output_dir, &cli.config),
-        Commands::BuildFilter { batch, source, output } => cmd_build_filter(cfg, batch.as_deref(), source.as_deref(), output.as_deref()),
-        Commands::FilterQuery { address, filter } => cmd_filter_query(cfg, &address, filter.as_deref()),
+        Commands::Fetch { chain, addr_only, batch, rpc, output_dir, btc } => {
+            if btc { btc_fetcher::run_btc_fetch(&cfg, batch.as_deref().unwrap_or(&[]), rpc.as_deref()) }
+            else { cmd_fetch(cfg, &chain, addr_only, batch.as_deref(), rpc, output_dir, &cli.config) }
+        }
+        Commands::BuildFilter { batch, source, output, btc } => {
+            if btc { cmd_build_filter_btc(cfg, batch.as_deref(), source.as_deref(), output.as_deref()) }
+            else { cmd_build_filter(cfg, batch.as_deref(), source.as_deref(), output.as_deref()) }
+        }
+        Commands::FilterQuery { address, filter, btc } => {
+            if btc { cmd_filter_query_btc(cfg, &address, filter.as_deref()) }
+            else { cmd_filter_query(cfg, &address, filter.as_deref()) }
+        }
         Commands::FetchTest { rpc, block } => cmd_fetch_test(cfg, rpc, block),
-        Commands::Collide { threads, gpu } => cmd_collide(cfg, threads, gpu),
-        Commands::IdInfo { id, all } => cmd_id_info(cfg, id, all),
+        Commands::Collide { threads, gpu, btc } => {
+            if btc { btc_collider::run_btc_collider(&cfg, threads) }
+            else { cmd_collide(cfg, threads, gpu) }
+        }
+        Commands::IdInfo { id, all, btc } => {
+            if btc { cmd_id_info_btc(cfg, id, all) }
+            else { cmd_id_info(cfg, id, all) }
+        }
     }
 }
 
@@ -610,6 +642,158 @@ fn cmd_fetch_test(
     sorted.sort();
     for (i, hex_addr) in sorted.into_iter().enumerate() {
         println!("  {}  0x{}", i + 1, hex_addr);
+    }
+    Ok(())
+}
+
+// ── BTC 命令 ──
+
+fn cmd_build_filter_btc(
+    cfg: config::AppConfig, _batch: Option<&[u64]>, source: Option<&str>, output: Option<&str>,
+) -> Result<()> {
+    use crate::filter;
+    cfg.ensure_btc_dirs()?;
+    let addr_root = source.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.btc_address_dir());
+    let out_dir = output.map(std::path::PathBuf::from).unwrap_or_else(|| cfg.btc_filter_dir());
+    std::fs::create_dir_all(&out_dir)?;
+    anyhow::ensure!(addr_root.exists(), "BTC 地址目录不存在: {}", addr_root.display());
+    let existing_bf = collider::load_all_bf_pub(&out_dir).unwrap_or_default();
+    let has_existing = !existing_bf.is_empty();
+    if has_existing { println!("  已加载 {} 组已有 BF，增量构建", existing_bf.len()); }
+    let mut set1 = std::collections::HashSet::<u64>::new();
+    let mut set2 = std::collections::HashSet::<u64>::new();
+    let mut set3 = std::collections::HashSet::<u64>::new();
+    let mut skipped = 0u64;
+    let mut included_segments: Vec<String> = Vec::new();
+    let entries_rd = std::fs::read_dir(&addr_root)?;
+    let mut seg_dirs: Vec<std::path::PathBuf> = entries_rd.filter_map(|e| {
+        let p = e.ok()?.path();
+        if p.is_dir() { Some(p) } else { None }
+    }).collect();
+    seg_dirs.sort();
+    anyhow::ensure!(!seg_dirs.is_empty(), "BTC 地址目录为空: {}", addr_root.display());
+    for seg_dir in &seg_dirs {
+        let seg_name = seg_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let addrs = fetcher::read_addresses_from_addr_dir(seg_dir)?;
+        if addrs.is_empty() { continue; }
+        let mut batch_new = 0u64;
+        for addr in &addrs {
+            if has_existing && collider::contains_bf_pub(&existing_bf, addr) { skipped += 1; continue; }
+            set1.insert(filter::addr_to_u64(addr));
+            set2.insert(filter::addr_to_u64_alt(addr));
+            set3.insert(filter::addr_to_u64_alt2(addr));
+            batch_new += 1;
+        }
+        println!("    {} 读取 {} 地址（新增 {}）", seg_name, addrs.len(), batch_new);
+        included_segments.push(seg_name);
+    }
+    if skipped > 0 { println!("  跳过已存在地址 {} 个", skipped); }
+    let entries = set1.len();
+    if entries == 0 {
+        println!("  所有地址已在已有 BF 中，无需新过滤器");
+        return Ok(());
+    }
+    let keys1: Vec<u64> = set1.into_iter().collect();
+    let keys2: Vec<u64> = set2.into_iter().collect();
+    let keys3: Vec<u64> = set3.into_iter().collect();
+    let base_name = format!("filter.btc-{}", included_segments.len());
+    let out_path = out_dir.join(format!("{}.bin", base_name));
+    let out_alt = out_dir.join(format!("{}.alt.bin", base_name));
+    let out_alt2 = out_dir.join(format!("{}.alt2.bin", base_name));
+    if out_path.exists() {
+        println!("  {} 已存在，跳过", out_path.display());
+        return Ok(());
+    }
+    println!("  BTC 构建 BF: {} 个唯一指纹 ...", entries);
+    let f1 = filter::build_fuse16(&keys1)?;
+    let f2 = filter::build_fuse16(&keys2)?;
+    let f3 = filter::build_fuse16(&keys3)?;
+    filter::save_fuse16(&f1, &out_path)?;
+    filter::save_fuse16(&f2, &out_alt)?;
+    filter::save_fuse16(&f3, &out_alt2)?;
+    println!("  BTC BuildFilter done: {} segments, {} entries, skipped={} -> {}",
+        included_segments.len(), entries, skipped, out_path.display());
+    Ok(())
+}
+
+fn cmd_filter_query_btc(
+    cfg: config::AppConfig, address: &str, filter_path: Option<&str>,
+) -> Result<()> {
+    let addr_str = address.trim();
+    let hash160 = btc_fetcher::decode_base58_addr(addr_str)
+        .or_else(|| btc_fetcher::decode_bech32_addr(addr_str))
+        .ok_or_else(|| anyhow::anyhow!("无法解码 BTC 地址: {}", addr_str))?;
+    let dir = match filter_path {
+        Some(s) => std::path::PathBuf::from(s),
+        None => cfg.btc_filter_dir(),
+    };
+    anyhow::ensure!(dir.exists(), "BTC BF 目录不存在: {}", dir.display());
+    println!("  加载 BTC BF: {}", dir.display());
+    let (hit, count) = collider::bf_contains_verbose(&dir, &hash160)?;
+    println!("  已加载 {} 组 BF | 查询: {} | hash160: {}", count, addr_str, hex::encode(hash160));
+    println!("  结果: {}", if hit { "命中" } else { "未命中" });
+    println!("{}", if hit { 1 } else { 0 });
+    Ok(())
+}
+
+fn cmd_id_info_btc(cfg: config::AppConfig, id: u64, _all: bool) -> Result<()> {
+    let seed_key = collider::load_or_create_seed(&cfg.generator_seed_path())?;
+    let entropy = {
+        use hmac::Mac;
+        type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&seed_key).expect("HMAC key");
+        mac.update(&id.to_le_bytes());
+        let h1 = mac.finalize().into_bytes();
+        let mut mac = HmacSha256::new_from_slice(&seed_key).expect("HMAC key");
+        mac.update(&h1);
+        mac.update(&(id.wrapping_add(1)).to_le_bytes());
+        let h2 = mac.finalize().into_bytes();
+        let mut out = [0u8; 32];
+        out[..16].copy_from_slice(&h1[..16]);
+        out[16..].copy_from_slice(&h2[..16]);
+        out
+    };
+    let m = bip32::Mnemonic::from_entropy(entropy, bip32::Language::English);
+    let phrase = m.phrase().to_string();
+    let seed_bytes = m.to_seed("");
+    let mut seed = [0u8; 64];
+    seed.copy_from_slice(seed_bytes.as_ref());
+    println!("═══ BTC ID {} ═══", id);
+    println!("  助记词: {}", phrase);
+    for &purpose in &[44u32, 49, 84] {
+        let label = match purpose { 44 => "P2PKH", 49 => "P2SH-P2WPKH", _ => "P2WPKH" };
+        let path_str = format!("m/{}'/0'/0'/0'/0", purpose);
+        use bip32::{DerivationPath, XPrv};
+        let path: DerivationPath = path_str.parse().map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let xprv = XPrv::derive_from_path(&seed, &path).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&xprv.to_bytes());
+        let secp = secp256k1::Secp256k1::new();
+        let pk = secp256k1::PublicKey::from_secret_key(
+            &secp, &secp256k1::SecretKey::from_slice(&sk).map_err(|e| anyhow::anyhow!("{:?}", e))?,
+        );
+        let compressed = pk.serialize();
+        use ripemd::Digest;
+        let sha = sha2::Sha256::digest(&compressed);
+        let rip = ripemd::Ripemd160::digest(&sha);
+        let mut h160 = [0u8; 20];
+        h160.copy_from_slice(&rip);
+        let addr = btc_fetcher::decode_base58_addr("dummy").is_none(); // no-op, just to make btc_fetcher usable
+        let _ = addr;
+        let btc_addr = match purpose {
+            44 => { let mut p = vec![0x00]; p.extend_from_slice(&h160); bs58::encode(p).with_check().into_string() }
+            49 => {
+                let mut redeem = vec![0x00, 0x14];
+                redeem.extend_from_slice(&h160);
+                let script_hash = ripemd::Ripemd160::digest(&sha2::Sha256::digest(&redeem));
+                let mut p = vec![0x05]; p.extend_from_slice(&script_hash);
+                bs58::encode(p).with_check().into_string()
+            }
+            _ => format!("bc1q...{}", hex::encode(&h160[..4])),
+        };
+        println!("  [{} | {}] {}", label, path_str, btc_addr);
+        println!("    hash160: {}", hex::encode(h160));
+        println!("    privkey: {}", hex::encode(sk));
     }
     Ok(())
 }

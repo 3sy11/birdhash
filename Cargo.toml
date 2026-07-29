@@ -34,6 +34,8 @@ arrow = { version = "58", default-features = false }
 parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
 bip32 = "0.5"
 libloading = "0.8"
+ripemd = "0.1"
+bs58 = { version = "0.5", features = ["check"] }
 
 [build-dependencies]
 # build.rs 编译 GPU kernel 到 PTX（使用 nightly rustc，仅构建时需要）

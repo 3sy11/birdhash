@@ -959,6 +959,29 @@ pub fn read_addresses_from_range_dir(range_dir: &Path) -> Result<Vec<Address>> {
     Ok(addresses)
 }
 
+// ── BTC 辅助（仅新增，不修改 ETH 逻辑） ──
+
+pub fn seg_start_for(block: u64) -> u64 { seg_start(block) }
+
+pub fn load_btc_checkpoint(path: &std::path::Path) -> u64 {
+    let ck_path = path;
+    if !ck_path.exists() { return 0; }
+    std::fs::read_to_string(ck_path).ok()
+        .and_then(|s| serde_json::from_str::<FetchRangeCheckpoint>(&s).ok())
+        .map(|c| c.last_fetched_block)
+        .unwrap_or(0)
+}
+
+pub fn save_btc_checkpoint(path: &std::path::Path, last_block: u64) -> Result<()> {
+    let cp = FetchRangeCheckpoint {
+        start_block: 0, end_block: 0,
+        last_fetched_block: last_block,
+        status: "running".into(),
+        updated_at: Utc::now(),
+    };
+    save_checkpoint_static(path, &cp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
