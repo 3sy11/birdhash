@@ -1,6 +1,8 @@
 //! BTC 链上地址获取器：BTC Core JSON-RPC + 两层去重（BF + Bloom）+ addr parquet 落盘。
 
 use anyhow::{Context, Result};
+use ripemd::Ripemd160;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
 
@@ -11,10 +13,18 @@ use crate::fetcher;
 
 const ADDR_LEN: usize = 20;
 type Address = [u8; ADDR_LEN];
-const SEGMENT_SIZE: u64 = 10;
-const CHUNK_SIZE: u64 = 10;
-const CHECKPOINT_INTERVAL: u64 = 5;
+const SEGMENT_SIZE: u64 = 100;
+const CHUNK_SIZE: u64 = 100;
+const CHECKPOINT_INTERVAL: u64 = 10;
 const DEDUP_CAPACITY_PER_SEGMENT: u64 = 500_000;
+
+fn btc_seg_start(block: u64) -> u64 { if block == 0 { 0 } else { ((block - 1) / SEGMENT_SIZE) * SEGMENT_SIZE } }
+fn btc_seg_dir_name(seg_s: u64) -> String { format!("{}-{}", seg_s, seg_s + SEGMENT_SIZE - 1) }
+fn hash160(data: &[u8]) -> Address {
+    let mut out = [0u8; ADDR_LEN];
+    out.copy_from_slice(&Ripemd160::digest(Sha256::digest(data)));
+    out
+}
 
 // ── BTC Core JSON-RPC ──
 
@@ -141,30 +151,55 @@ fn convert_bits(data: &[u8], from_bits: u32, to_bits: u32, pad: bool) -> Option<
     Some(out)
 }
 
-/// 从 BTC 区块 JSON 提取所有地址 hash160
+/// 从 scriptPubKey.hex 提取 hash160（覆盖早期 P2PK 无 address 字段的情况）
+fn hash160_from_script_hex(hex_str: &str) -> Option<Address> {
+    let script = hex::decode(hex_str).ok()?;
+    // P2PK uncompressed: 41 <65B pubkey> ac
+    if script.len() == 67 && script[0] == 0x41 && script[66] == 0xac { return Some(hash160(&script[1..66])); }
+    // P2PK compressed: 21 <33B pubkey> ac
+    if script.len() == 35 && script[0] == 0x21 && script[34] == 0xac { return Some(hash160(&script[1..34])); }
+    // P2PKH: 76 a9 14 <20B> 88 ac
+    if script.len() == 25 && script[0] == 0x76 && script[1] == 0xa9 && script[2] == 0x14 && script[23] == 0x88 && script[24] == 0xac {
+        let mut out = [0u8; ADDR_LEN]; out.copy_from_slice(&script[3..23]); return Some(out);
+    }
+    // P2SH: a9 14 <20B> 87
+    if script.len() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87 {
+        let mut out = [0u8; ADDR_LEN]; out.copy_from_slice(&script[2..22]); return Some(out);
+    }
+    // P2WPKH: 00 14 <20B>
+    if script.len() == 22 && script[0] == 0x00 && script[1] == 0x14 {
+        let mut out = [0u8; ADDR_LEN]; out.copy_from_slice(&script[2..22]); return Some(out);
+    }
+    None
+}
+
+/// 从 BTC 区块 JSON 提取所有地址 hash160（含早期 P2PK）
 pub fn extract_addresses_from_btc_block(block: &serde_json::Value) -> Vec<Address> {
     let mut addrs = Vec::new();
-    let txs = match block["tx"].as_array() {
-        Some(a) => a,
-        None => return addrs,
-    };
+    let txs = match block["tx"].as_array() { Some(a) => a, None => return addrs };
     for tx in txs {
-        if let Some(vouts) = tx["vout"].as_array() {
-            for vout in vouts {
-                if let Some(addr_str) = vout["scriptPubKey"]["address"].as_str() {
-                    if let Some(h) = decode_base58_addr(addr_str).or_else(|| decode_bech32_addr(addr_str)) {
-                        addrs.push(h);
-                    }
+        let Some(vouts) = tx["vout"].as_array() else { continue };
+        for vout in vouts {
+            let sp = &vout["scriptPubKey"];
+            let mut got = false;
+            if let Some(addr_str) = sp["address"].as_str() {
+                if let Some(h) = decode_base58_addr(addr_str).or_else(|| decode_bech32_addr(addr_str)) {
+                    addrs.push(h); got = true;
                 }
-                // 某些节点用 addresses 数组
-                if let Some(arr) = vout["scriptPubKey"]["addresses"].as_array() {
-                    for a in arr {
-                        if let Some(s) = a.as_str() {
-                            if let Some(h) = decode_base58_addr(s).or_else(|| decode_bech32_addr(s)) {
-                                addrs.push(h);
-                            }
+            }
+            if let Some(arr) = sp["addresses"].as_array() {
+                for a in arr {
+                    if let Some(s) = a.as_str() {
+                        if let Some(h) = decode_base58_addr(s).or_else(|| decode_bech32_addr(s)) {
+                            addrs.push(h); got = true;
                         }
                     }
+                }
+            }
+            // 早期块 type=pubkey 无 address 字段，从 hex 解析
+            if !got {
+                if let Some(hex_str) = sp["hex"].as_str() {
+                    if let Some(h) = hash160_from_script_hex(hex_str) { addrs.push(h); }
                 }
             }
         }
@@ -208,6 +243,7 @@ pub fn run_btc_fetch(
 
     // 第二层：从已有 parquet 重建 dedup Bloom
     let addr_root = cfg.btc_address_dir();
+    println!("  BTC 地址落盘根目录: {}", addr_root.display());
     let extra_cap = batches.len() as u64 * DEDUP_CAPACITY_PER_SEGMENT;
     let mut bloom = rebuild_bloom_from_dir(&addr_root, extra_cap)?;
     println!("  第二层去重：Bloom {} 已有地址, 容量 {:.0}MB", bloom.count(), bloom.memory_bytes() as f64 / 1_048_576.0);
@@ -225,36 +261,28 @@ pub fn run_btc_fetch(
 }
 
 fn rebuild_bloom_from_dir(addr_root: &Path, extra_capacity: u64) -> Result<DedupBloom> {
-    let mut count = 0u64;
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
     if addr_root.exists() {
         if let Ok(entries) = std::fs::read_dir(addr_root) {
             for e in entries.flatten() {
                 let dir = e.path();
                 if !dir.is_dir() { continue; }
-                for i in 0..100u32 {
-                    let p = dir.join(format!("chunk_{:03}.parquet", i));
-                    if p.exists() {
-                        count += fetcher::read_addr_parquet(&p).map(|v| v.len() as u64).unwrap_or(0);
+                if let Ok(chunks) = std::fs::read_dir(&dir) {
+                    for c in chunks.flatten() {
+                        let p = c.path();
+                        if p.extension().and_then(|s| s.to_str()) == Some("parquet") { files.push(p); }
                     }
                 }
             }
         }
     }
+    let mut count = 0u64;
+    for p in &files { count += fetcher::read_addr_parquet(p).map(|v| v.len() as u64).unwrap_or(0); }
     let capacity = (count + extra_capacity).max(1_000_000);
     let mut bloom = DedupBloom::new(capacity, 1e-8);
-    if count > 0 && addr_root.exists() {
-        if let Ok(entries) = std::fs::read_dir(addr_root) {
-            for e in entries.flatten() {
-                let dir = e.path();
-                if !dir.is_dir() { continue; }
-                for i in 0..100u32 {
-                    let p = dir.join(format!("chunk_{:03}.parquet", i));
-                    if !p.exists() { continue; }
-                    if let Ok(addrs) = fetcher::read_addr_parquet(&p) {
-                        for a in &addrs { bloom.insert(a); }
-                    }
-                }
-            }
+    if count > 0 {
+        for p in &files {
+            if let Ok(addrs) = fetcher::read_addr_parquet(p) { for a in &addrs { bloom.insert(a); } }
         }
         println!("  Bloom 重建完成：{} 个已有地址", bloom.count());
     }
@@ -266,10 +294,11 @@ fn run_btc_segment(
     start_block: u64, end_block: u64,
     bf_triples: &[collider::BfTriple], bloom: &mut DedupBloom, has_bf: bool,
 ) -> Result<()> {
-    let seg_s = fetcher::seg_start_for(start_block);
-    let seg_name = fetcher::seg_dir_name(seg_s);
+    let seg_s = btc_seg_start(start_block);
+    let seg_name = btc_seg_dir_name(seg_s);
     let seg_dir = addr_root.join(&seg_name);
     std::fs::create_dir_all(&seg_dir)?;
+    println!("    落盘目录: {}", seg_dir.display());
 
     // checkpoint
     let ck_path = seg_dir.join("checkpoint.json");
@@ -378,5 +407,15 @@ mod tests {
         });
         let addrs = extract_addresses_from_btc_block(&block);
         assert_eq!(addrs.len(), 2);
+    }
+
+    #[test]
+    fn extract_p2pk_genesis_no_address_field() {
+        // 创世块 coinbase：type=pubkey，无 address，只能从 hex 解析
+        let hex = "4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac";
+        let block = serde_json::json!({"tx":[{"vout":[{"scriptPubKey":{"type":"pubkey","hex":hex}}]}]});
+        let addrs = extract_addresses_from_btc_block(&block);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(hex::encode(addrs[0]), "62e907b15cbf27d5425399ebf6f0fb50ebb88f18");
     }
 }

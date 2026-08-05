@@ -961,8 +961,6 @@ pub fn read_addresses_from_range_dir(range_dir: &Path) -> Result<Vec<Address>> {
 
 // ── BTC 辅助（仅新增，不修改 ETH 逻辑） ──
 
-pub fn seg_start_for(block: u64) -> u64 { seg_start(block) }
-
 pub fn load_btc_checkpoint(path: &std::path::Path) -> u64 {
     let ck_path = path;
     if !ck_path.exists() { return 0; }
